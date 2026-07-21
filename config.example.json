@@ -1,0 +1,18 @@
+{
+  "account_map": {
+    "ONE_ACCOUNT_NAME": "IBKR_ACCOUNT_ID"
+  },
+  "ignore_one_accounts": [],
+  "one_export_dirs": ["~/Downloads", "~/Documents"],
+  "flex_timezone": "Australia/Sydney",
+  "account_codes": {
+    "IBKR_ACCOUNT_ID": "ACCOUNT_CODE"
+  },
+  "one_os_price_tol": 0.10,
+  "acknowledged": [],
+  "tolerances": {
+    "price_abs": 0.05,
+    "price_pct": 0.005,
+    "expiry_days": 4
+  }
+}

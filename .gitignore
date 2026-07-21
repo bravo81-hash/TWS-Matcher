@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local account mappings and generated position data
+config.json
+canonical_positions.json
+one_positions.json
+reconciliation.json
+optionstrat_urls.json
+flex_export/
+
+# Private exports and local working material
+samples/
+*ONESummaryReport*.csv
+*ONEDetailReport*.csv
+all-active*.xlsx
+*.mdb
+AGENTS.md
+CLAUDE.md
+.agents/
