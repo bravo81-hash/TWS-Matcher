@@ -14,5 +14,13 @@
     "price_abs": 0.05,
     "price_pct": 0.005,
     "expiry_days": 4
+  },
+  "email": {
+    "enabled": true,
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 587,
+    "username": "bsarvaiya06@gmail.com",
+    "password": "YOUR_GMAIL_APP_PASSWORD_HERE",
+    "to_email": "bsarvaiya06@gmail.com"
   }
 }

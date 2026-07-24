@@ -103,7 +103,7 @@ class PositionName:
 
     def format(self) -> str:
         strat = f"{self.strategy}-{self.structure}" if self.structure else self.strategy
-        core = ".".join([self.account, self.ticker, strat, self.expiry])
+        core = ".".join([self.expiry, strat, self.account, self.ticker])
         if self.seq:
             core = f"{core}.{self.seq}"
         if self.lots is not None:
@@ -121,8 +121,16 @@ class PositionName:
         parts = raw.split(".")
         if len(parts) not in (4, 5):
             raise ValueError(f"expected 4-5 dot fields, got {len(parts)}: {s!r}")
-        account, ticker, strat_field, expiry = parts[:4]
+        
+        f0, f1, f2, f3 = parts[:4]
         seq = parts[4] if len(parts) == 5 else None
+        
+        # Flexibly handle both EXPIRY.STRATEGY.ACCOUNT.TICKER and ACCOUNT.TICKER.STRATEGY.EXPIRY
+        if f0 in ACCOUNTS:
+            account, ticker, strat_field, expiry = f0, f1, f2, f3
+        else:
+            expiry, strat_field, account, ticker = f0, f1, f2, f3
+            
         if "-" in strat_field:
             strategy, structure = strat_field.split("-", 1)
         else:

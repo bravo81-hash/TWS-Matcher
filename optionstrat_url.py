@@ -33,6 +33,7 @@ not embedded.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -107,10 +108,40 @@ def combo_legs(tlegs):
     return out
 
 
+def build_urls_from_ibkr(ibkr_legs):
+    """Build OptionStrat URLs directly from IBKR source of truth."""
+    if not ibkr_legs:
+        return []
+    by_acct_und = defaultdict(list)
+    for lg in ibkr_legs:
+        if lg.get("secType") not in (None, "OPT") or not lg.get("right"):
+            continue
+        acct = lg.get("account", "UNKNOWN")
+        und = lg.get("underlying", "SPX")
+        by_acct_und[(acct, und)].append(lg)
+    
+    out = []
+    for (acct, und), legs in sorted(by_acct_und.items()):
+        resolved = [(lg, lg.get("expiry")) for lg in legs]
+        url = build_url(und, resolved)
+        out.append({
+            "account": acct,
+            "underlying": und,
+            "url": url,
+            "leg_count": len(legs),
+            "legs": [{
+                "side": "Buy" if lg["qty"] > 0 else "Sell",
+                "qty": abs(int(round(lg["qty"]))),
+                "label": f"{lg['tradingClass']} {_pretty_exp(lg['expiry'])} {_strike(lg['strike'])}{lg['right']}",
+                "price": round(lg.get("avg_price", 0.0), 4)
+            } for lg in legs]
+        })
+    return out
+
+
 def generate(path: str, ibkr_legs=None) -> dict:
-    # ibkr_legs kept for call-compatibility; OptionStrat uses ONE's listed expiry.
-    # One entry per ONE combo (by name) = the saved OptionStrat strategy to EDIT.
-    legs = one_reader.read_summary_report(path)
+    # ibkr_legs kept for call-compatibility & direct URL building
+    legs = one_reader.read_summary_report(path) if path and os.path.exists(path) else []
     trades = group_by_trade(legs)
     out = []
     for (account, trade_id), tlegs in trades.items():
@@ -131,10 +162,12 @@ def generate(path: str, ibkr_legs=None) -> dict:
             "create_urls": new_urls,
         })
     out.sort(key=lambda r: (r["account"], r["name"]))
+    ibkr_urls = build_urls_from_ibkr(ibkr_legs)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_file": path,
         "strategies": out,
+        "ibkr_urls": ibkr_urls,
     }
 
 

@@ -41,6 +41,7 @@ from zoneinfo import ZoneInfo
 from ib_async import IB
 
 import canonical_engine as eng
+import email_report
 import flex_export
 import naming_check
 import one_reader
@@ -143,9 +144,12 @@ def run_cycle(ib: IB, cfg: dict):
         ibkr_snap, cfg.get("flex_timezone"))
 
     # classify broker activity since the last ONE export (rolled/opened/closed/...)
+    one_raw_legs = one_reader.read_summary_report(one_path) if (one_path and os.path.exists(one_path)) else []
     fills_since = [f for f in ibkr_snap.get("fills_today", [])
                    if one_mtime and (_fill_epoch(f.get("time")) or 0) > one_mtime]
-    activity = reconcile.classify_activity(fills_since, ibkr_snap["legs"])
+    activity = reconcile.classify_activity(fills_since, ibkr_snap["legs"],
+                                           one_legs=one_raw_legs,
+                                           account_map=cfg.get("account_map"))
 
     # naming-convention migration status per ONE combo
     try:
@@ -197,59 +201,64 @@ def _set(**kw):
 
 # --------------------------------------------------------------- rendering
 STATUS_COLORS = {
-    "MATCH": "#1a7f37", "PRICE_DRIFT": "#9a6700", "QTY_MISMATCH": "#cf222e",
+    "MATCH": "#1a7f37", "MATCH_FIFO_AVG": "#0969da", "PRICE_DRIFT": "#9a6700", "QTY_MISMATCH": "#cf222e",
     "IBKR_ONLY": "#0969da", "ONE_ONLY": "#8250df",
 }
-ORDER = ["QTY_MISMATCH", "ONE_ONLY", "IBKR_ONLY", "PRICE_DRIFT", "MATCH"]
+ORDER = ["QTY_MISMATCH", "ONE_ONLY", "IBKR_ONLY", "PRICE_DRIFT", "MATCH_FIFO_AVG", "MATCH"]
 
 PAGE_STYLE = (
-    "body{font:13px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;"
+    "body{font:12.5px/1.35 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;"
     "margin:0;background:#0d1117;color:#e6edf3}"
-    ".wrap{max-width:1080px;margin:0 auto;padding:18px}"
-    "h1{font-size:18px;margin:0 0 4px} .sub{color:#8b949e;margin-bottom:14px}"
-    ".acct{background:#161b22;border:1px solid #30363d;border-radius:8px;"
-    "padding:12px 14px;margin:12px 0}"
-    ".acct h2{font-size:14px;margin:0 0 8px;display:flex;justify-content:space-between}"
-    ".pill{border-radius:12px;padding:1px 9px;font-size:12px;font-weight:600}"
+    ".wrap{width:98%;max-width:1800px;margin:0 auto;padding:8px 12px;box-sizing:border-box}"
+    "h1{font-size:16px;margin:0 0 2px} .sub{color:#8b949e;margin-bottom:8px;font-size:12px}"
+    ".acct{background:#161b22;border:1px solid #30363d;border-radius:6px;"
+    "padding:8px 10px;margin:6px 0;box-sizing:border-box}"
+    ".acct h2{font-size:13px;margin:0 0 6px;display:flex;justify-content:space-between;align-items:center}"
+    ".pill{border-radius:10px;padding:1px 7px;font-size:11px;font-weight:600}"
     ".MATCHpill{background:#1a7f3733;color:#3fb950}"
     ".DIFFpill{background:#cf222e33;color:#ff7b72}"
+    ".table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}"
     "table{border-collapse:collapse;width:100%}"
-    "td,th{padding:3px 8px;text-align:right;border-bottom:1px solid #21262d}"
+    "td,th{padding:3px 6px;text-align:right;border-bottom:1px solid #21262d;white-space:nowrap}"
     "td.l,th.l{text-align:left} .mono{font-variant-numeric:tabular-nums}"
-    ".tag{font-weight:700;font-size:11px;padding:1px 6px;border-radius:5px;color:#fff}"
+    ".tag{font-weight:700;font-size:10.5px;padding:1px 5px;border-radius:4px;color:#fff;white-space:nowrap}"
     ".muted{color:#8b949e} a.btn{display:inline-block;background:#238636;color:#fff;"
-    "padding:6px 14px;border-radius:6px;text-decoration:none;font-weight:600}"
+    "padding:4px 10px;border-radius:5px;text-decoration:none;font-weight:600;font-size:12px}"
     ".warn{color:#d29922}"
     # top-level page nav
-    ".pagenav{margin-bottom:14px;display:flex;gap:4px}"
-    ".pagenav a{color:#8b949e;text-decoration:none;padding:6px 12px;border-radius:6px;"
-    "font-weight:600;font-size:13px}"
+    ".pagenav{margin-bottom:8px;display:flex;gap:4px}"
+    ".pagenav a{color:#8b949e;text-decoration:none;padding:4px 10px;border-radius:5px;"
+    "font-weight:600;font-size:12px}"
     ".pagenav a.active{color:#e6edf3;background:#161b22;border:1px solid #30363d}"
     ".pagenav a:hover:not(.active){color:#e6edf3}"
-    # in-page tab groups (OptionStrat mirror, Fills)
+    # in-page tab groups
     ".tabnav{display:flex;gap:4px;flex-wrap:wrap;border-bottom:1px solid #30363d;"
-    "margin-bottom:10px}"
-    ".tabbtn{padding:5px 12px;border-radius:6px 6px 0 0;cursor:pointer;color:#8b949e;"
-    "text-decoration:none;font-size:12.5px;border:1px solid transparent;"
+    "margin-bottom:8px}"
+    ".tabbtn{padding:4px 12px;border-radius:5px 5px 0 0;cursor:pointer;color:#8b949e;"
+    "text-decoration:none;font-size:12px;font-weight:600;border:1px solid transparent;"
     "margin-bottom:-1px;background:none}"
-    ".tabbtn.active{color:#e6edf3;background:#0d1117;border-color:#30363d;"
-    "border-bottom-color:#0d1117}"
+    ".tabbtn.active{color:#e6edf3;background:#161b22;border-color:#30363d;"
+    "border-bottom-color:#161b22}"
     ".tabpanel{display:none}.tabpanel.active{display:block}"
     # sortable table headers
     "th.sortable{cursor:pointer;user-select:none}"
     "th.sortable:hover{color:#e6edf3}"
     "th.sortable::after{content:'\\2195';opacity:0.35;margin-left:4px}"
     "th.sortable.sorted::after{opacity:1}"
+    ".grid-accts{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:10px;margin:6px 0}"
+    ".grid-accts > .acct{margin:0;min-width:0;overflow-x:auto}"
+    "@media(max-width:768px){.grid-accts{grid-template-columns:1fr}.wrap{width:100%;padding:4px 6px}}"
 )
 
-TAB_JS = """
+TAB_JS = r"""
 <script>
 (function(){
   function initTabs(){
     document.querySelectorAll('[data-tabgroup]').forEach(function(group){
       var gid = group.getAttribute('data-tabgroup');
-      var buttons = Array.prototype.slice.call(group.querySelectorAll('.tabbtn'));
-      var panels = Array.prototype.slice.call(group.querySelectorAll('.tabpanel'));
+      var nav = group.querySelector(':scope > .tabnav');
+      var buttons = nav ? Array.prototype.slice.call(nav.querySelectorAll(':scope > .tabbtn')) : Array.prototype.slice.call(group.querySelectorAll(':scope > .tabbtn'));
+      var panels = Array.prototype.slice.call(group.querySelectorAll(':scope > .tabpanel'));
       var keys = buttons.map(function(b){ return b.getAttribute('data-tab'); });
       if (!keys.length) return;
       var saved = sessionStorage.getItem('tab:' + gid);
@@ -304,8 +313,160 @@ TAB_JS = """
       });
     });
   }
-  document.addEventListener('DOMContentLoaded', function(){ initTabs(); initSort(); });
+  document.addEventListener('DOMContentLoaded', function(){ initTabs(); initSort(); if (window.initAdjustments) window.initAdjustments(); });
 })();
+
+window.initAdjustments = function() {
+  var sortBySelect = document.getElementById('adj-sort-by');
+  var qInput = document.getElementById('adj-filter-search');
+  if (!sortBySelect || !window.ADJ_DATA) return;
+
+  var savedSort = sessionStorage.getItem('adj_sort_by');
+  if (savedSort && sortBySelect.querySelector('option[value="' + savedSort + '"]')) {
+    sortBySelect.value = savedSort;
+  }
+
+  var savedQuery = sessionStorage.getItem('adj_filter_query');
+  if (savedQuery !== null && qInput) {
+    qInput.value = savedQuery;
+  }
+
+  window.renderAdjustments();
+
+  var wasFocused = sessionStorage.getItem('adj_filter_focused') === 'true';
+  if (wasFocused && qInput) {
+    qInput.focus();
+    var pos = qInput.value.length;
+    try { qInput.setSelectionRange(pos, pos); } catch(e) {}
+  }
+};
+
+window.setAdjSort = function(mode) {
+  var sel = document.getElementById('adj-sort-by');
+  if (sel) {
+    sel.value = mode;
+    sessionStorage.setItem('adj_sort_by', mode);
+    window.renderAdjustments();
+  }
+};
+
+window.renderAdjustments = function() {
+  var container = document.getElementById('adj-content');
+  var sel = document.getElementById('adj-sort-by');
+  var qInput = document.getElementById('adj-filter-search');
+  if (!container || !window.ADJ_DATA) return;
+
+  var mode = sel ? sel.value : 'category';
+  sessionStorage.setItem('adj_sort_by', mode);
+
+  var rawQ = qInput ? qInput.value : '';
+  sessionStorage.setItem('adj_filter_query', rawQ);
+  var isFocused = (document.activeElement === qInput);
+  sessionStorage.setItem('adj_filter_focused', isFocused ? 'true' : 'false');
+
+  var q = rawQ.toLowerCase().trim();
+
+  var items = window.ADJ_DATA.filter(function(item) {
+    if (!q) return true;
+    var searchStr = (item.account + ' ' + item.category + ' ' + item.ticker + ' ' +
+                     item.label + ' ' + item.trade_id_str + ' ' + item.trade_name + ' ' +
+                     item.wizard_hint).toLowerCase();
+    return searchStr.indexOf(q) !== -1;
+  });
+
+  if (items.length === 0) {
+    container.innerHTML = "<div class='muted' style='padding:6px 0;'>No matching adjustments found for search query.</div>";
+    return;
+  }
+
+  var groups = {};
+  var groupOrder = [];
+
+  items.forEach(function(item) {
+    var gKey = '';
+    var gTitle = '';
+
+    if (mode === 'ticker') {
+      gKey = item.ticker || 'Other';
+      gTitle = 'Ticker: ' + gKey;
+    } else if (mode === 'trade_id') {
+      gKey = item.trade_id ? ('Trade #' + item.trade_id) : '[New Trade]';
+      gTitle = item.trade_id ? ('ONE Trade #' + item.trade_id + (item.trade_name ? ' (' + item.trade_name + ')' : '')) : 'ONE Wizard: Select [New Trade]';
+    } else if (mode === 'account') {
+      gKey = item.account || 'Unknown';
+      gTitle = 'Account: ' + gKey;
+    } else {
+      gKey = item.category;
+      gTitle = item.category;
+    }
+
+    if (!groups[gKey]) {
+      groups[gKey] = { title: gTitle, key: gKey, items: [], order: item.category_order };
+      groupOrder.push(gKey);
+    }
+    groups[gKey].items.push(item);
+  });
+
+  groupOrder.sort(function(a, b) {
+    if (mode === 'category') {
+      return groups[a].order - groups[b].order;
+    } else if (mode === 'trade_id') {
+      var numA = parseInt(a.replace(/\D/g, '')) || 999999;
+      var numB = parseInt(b.replace(/\D/g, '')) || 999999;
+      return numA - numB;
+    } else {
+      return a.localeCompare(b);
+    }
+  });
+
+  var html = [];
+  groupOrder.forEach(function(gKey) {
+    var grp = groups[gKey];
+    var headerColor = '#f2cc60';
+    if (gKey === 'Rolled' || gKey === 'Adjusted') headerColor = '#d29922';
+    else if (gKey === 'New / opened') headerColor = '#3fb950';
+    else if (gKey === 'Closed') headerColor = '#ff7b72';
+    else if (mode !== 'category') headerColor = '#58a6ff';
+
+    html.push("<div style='color:" + headerColor + ";font-weight:600;margin-top:6px;margin-bottom:2px;font-size:12px;display:flex;justify-content:space-between;'>");
+    html.push("<span>" + escapeHtml(grp.title) + "</span>");
+    html.push("<span class='muted' style='font-weight:normal;font-size:11px;'>" + grp.items.length + " item(s)</span>");
+    html.push("</div>");
+
+    html.push("<div class='table-wrap'><table style='table-layout:fixed;width:100%;'>");
+    html.push("<colgroup><col style='width:90px;'><col style='width:auto;'><col style='width:105px;'></colgroup>");
+    grp.items.forEach(function(r) {
+      var hintHtml = r.wizard_hint ? " &nbsp;<span style='color:#58a6ff;font-size:11.5px'>👉 " + escapeHtml(r.wizard_hint) + "</span>" : "";
+      html.push("<tr>");
+      html.push("<td class='l' style='width:90px;font-weight:600;color:#e6edf3;'>" + escapeHtml(r.account) + "</td>");
+      html.push("<td class='l mono' style='color:" + r.color + ";'>" + r.details_html + hintHtml + "</td>");
+      html.push("<td class='mono' style='width:105px;text-align:right;'>" + escapeHtml(r.qty_str) + "</td>");
+      html.push("</tr>");
+    });
+    html.push("</table></div>");
+  });
+
+  container.innerHTML = html.join('');
+};
+
+window.copyAdjustmentsText = function() {
+  if (!window.ADJ_DATA) return;
+  var lines = ["=== TWS Matcher - Today's Trade Adjustments Checklist ==="];
+  window.ADJ_DATA.forEach(function(r) {
+    lines.push("[" + r.account + "] " + r.category.toUpperCase() + ": " + r.label + " | " + r.qty_str + " | " + r.wizard_hint);
+  });
+  var text = lines.join("\n");
+  navigator.clipboard.writeText(text).then(function() {
+    alert("Copied " + window.ADJ_DATA.length + " adjustment item(s) to clipboard!");
+  }).catch(function(err) {
+    console.error("Copy failed", err);
+  });
+};
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
 </script>
 """
 
@@ -434,7 +595,7 @@ def render_html() -> str:
     def _alerting(f):
         # actionable = real divergence, not acknowledged, not an expected
         # stock-only-in-IBKR line (ONE never models stocks, so those are noise).
-        if f["status"] == "MATCH" or f.get("acknowledged"):
+        if f["status"] in ("MATCH", "MATCH_FIFO_AVG") or f.get("acknowledged"):
             return False
         if f["status"] == "IBKR_ONLY" and str(f.get("label", "")).endswith("(STK)"):
             return False
@@ -461,7 +622,14 @@ def render_html() -> str:
     last = st.get("last_cycle") or "&mdash;"
     p(f"<div class='sub'>{conn} &nbsp;|&nbsp; status: {html.escape(str(st['status']))}"
       f" &nbsp;|&nbsp; last refresh: {html.escape(str(last))} UTC "
-      f"&nbsp;|&nbsp; <a class='btn' href='/check'>Check now</a></div>")
+      f"&nbsp;|&nbsp; <a class='btn' href='/check'>Check now</a> "
+      f"&nbsp;|&nbsp; <a class='btn' style='background:#1f6feb' href='/send_email'>📧 Email Report</a></div>")
+
+    if result and prob_n == 0:
+        p("<div class='acct' style='border:2px solid #238636;background:#0d2818;margin-bottom:14px'>"
+          "<h2 style='color:#3fb950;margin:0 0 4px'>🟢 ALL POSITIONS MATCHED &mdash; IBKR TRUTH IN SYNC</h2>"
+          "<div class='muted'>Zero unhedged legs and zero quantity mismatches across all accounts. Position sizing is 100% aligned.</div>"
+          "</div>")
 
     if st.get("error"):
         p(f"<div class='acct' style='border-color:#cf222e'><b class='warn'>"
@@ -486,60 +654,117 @@ def render_html() -> str:
         p(f"<div class='sub'>ONE export: {html.escape(one_file)} &middot; "
           f"{one_age}{warn}</div>")
 
-    # -------- ADJUSTMENT MODE: classified broker activity since last ONE export --
+    # -------- BUILD ADJUSTMENT DATA OBJECTS --------
+    adj_list = []
+    exp_t = ""
     if act_n:
-        exp_t = ""
         if st.get("one_mtime"):
             exp_t = " " + datetime.fromtimestamp(st["one_mtime"]).strftime("%H:%M")
-        p("<div class='acct' style='border:2px solid #d29922;background:#3a2d0a'>"
-          "<h2 style='color:#f2cc60'>&#9888; ADJUSTMENT MODE &mdash; "
-          f"{act_n} change(s) since your last ONE export{exp_t}</h2>"
-          "<div class='muted' style='margin-bottom:8px'>Replicate these in ONE "
-          "(re-export &rarr; Check now) and edit the same-named OptionStrat combos."
-          "</div>")
-
-        def _act_row(c1, c2, c3, color="#f2cc60"):
-            p(f"<tr><td class='l'>{c1}</td>"
-              f"<td class='l mono' style='color:{color}'>{c2}</td>"
-              f"<td class='mono'>{c3}</td></tr>")
 
         if act.get("rolled"):
-            p("<div style='color:#d29922;font-weight:600;margin-top:4px'>Rolled</div>"
-              "<table>")
             for r in act["rolled"]:
-                _act_row(html.escape(str(r["account"])),
-                         f"{html.escape(r['from'])} &rarr; {html.escape(r['to'])}",
-                         f"&times;{r['qty']:.0f}")
-            p("</table>")
-        if act.get("opened"):
-            p("<div style='color:#3fb950;font-weight:600;margin-top:4px'>New / opened</div>"
-              "<table>")
-            for o in act["opened"]:
-                _act_row(html.escape(str(o["account"])), html.escape(o["label"]),
-                         f"{o['qty']:+.0f} @ {o['px']:.4f}", "#3fb950")
-            p("</table>")
-        if act.get("closed"):
-            p("<div style='color:#ff7b72;font-weight:600;margin-top:4px'>Closed</div>"
-              "<table>")
-            for c in act["closed"]:
-                _act_row(html.escape(str(c["account"])), html.escape(c["label"]),
-                         f"was {c['qty']:+.0f}", "#ff7b72")
-            p("</table>")
-        if act.get("changed"):
-            p("<div style='color:#d29922;font-weight:600;margin-top:4px'>Adjusted</div>"
-              "<table>")
-            for c in act["changed"]:
-                _act_row(html.escape(str(c["account"])),
-                         f"{html.escape(c['label'])} ({c['type'].lower()})",
-                         f"{c['qty']:+.0f}")
-            p("</table>")
-        p("</div>")
+                tid = r.get("one_trade_id")
+                tname = r.get("one_trade_name") or ""
+                hint = r.get("wizard_hint", "")
+                adj_list.append({
+                    "account": str(r.get("account", "")),
+                    "category": "Rolled",
+                    "category_order": 1,
+                    "ticker": r.get("underlying") or str(r.get("from", "")).split()[0],
+                    "label": f"{r['from']} -> {r['to']}",
+                    "trade_id": tid,
+                    "trade_id_str": f"Trade #{tid}" if tid else "[New Trade]",
+                    "trade_name": tname,
+                    "wizard_hint": hint,
+                    "qty_str": f"x{r['qty']:.0f}",
+                    "color": "#d29922",
+                    "details_html": f"{html.escape(r['from'])} &rarr; {html.escape(r['to'])}"
+                })
 
-    # a finding is a real problem only if not MATCH and not acknowledged
+        if act.get("opened"):
+            for o in act["opened"]:
+                tid = o.get("one_trade_id")
+                tname = o.get("one_trade_name") or ""
+                hint = o.get("wizard_hint", "")
+                adj_list.append({
+                    "account": str(o.get("account", "")),
+                    "category": "New / opened",
+                    "category_order": 2,
+                    "ticker": o.get("underlying") or str(o.get("label", "")).split()[0],
+                    "label": o.get("label", ""),
+                    "trade_id": tid,
+                    "trade_id_str": f"Trade #{tid}" if tid else "[New Trade]",
+                    "trade_name": tname,
+                    "wizard_hint": hint,
+                    "qty_str": f"{o['qty']:+.0f} @ {o['px']:.4f}",
+                    "color": "#3fb950",
+                    "details_html": html.escape(o.get("label", ""))
+                })
+
+        if act.get("closed"):
+            for c in act["closed"]:
+                tid = c.get("one_trade_id")
+                tname = c.get("one_trade_name") or ""
+                hint = c.get("wizard_hint", "")
+                adj_list.append({
+                    "account": str(c.get("account", "")),
+                    "category": "Closed",
+                    "category_order": 3,
+                    "ticker": c.get("underlying") or str(c.get("label", "")).split()[0],
+                    "label": c.get("label", ""),
+                    "trade_id": tid,
+                    "trade_id_str": f"Trade #{tid}" if tid else "[New Trade]",
+                    "trade_name": tname,
+                    "wizard_hint": hint,
+                    "qty_str": f"was {c['qty']:+.0f}",
+                    "color": "#ff7b72",
+                    "details_html": html.escape(c.get("label", ""))
+                })
+
+        if act.get("changed"):
+            for ch in act["changed"]:
+                tid = ch.get("one_trade_id")
+                tname = ch.get("one_trade_name") or ""
+                hint = ch.get("wizard_hint", "")
+                adj_list.append({
+                    "account": str(ch.get("account", "")),
+                    "category": "Adjusted",
+                    "category_order": 4,
+                    "ticker": ch.get("underlying") or str(ch.get("label", "")).split()[0],
+                    "label": f"{ch.get('label', '')} ({ch.get('type', '').lower()})",
+                    "trade_id": tid,
+                    "trade_id_str": f"Trade #{tid}" if tid else "[New Trade]",
+                    "trade_name": tname,
+                    "wizard_hint": hint,
+                    "qty_str": f"{ch['qty']:+.0f}",
+                    "color": "#d29922",
+                    "details_html": f"{html.escape(ch.get('label', ''))} ({html.escape(ch.get('type', '').lower())})"
+                })
+
+    # -------- MAIN DASHBOARD TAB GROUP --------
+    fills = result.get("fills_today", [])
+    os_strats = st.get("os_strategies") or []
+    flex = st.get("flex") or {}
+    accts_count = len(result["accounts"])
+
+    p("<div data-tabgroup='main-dash' style='margin-top:10px;'>")
+    p("<div class='tabnav' style='font-size:13px;'>")
+    p(f"<a href='#' class='tabbtn active' data-tab='tab-reconcile'>🏦 Account Reconciliations ({accts_count})</a>")
+    if act_n:
+        p(f"<a href='#' class='tabbtn' data-tab='tab-adj'>⚠️ Trade Adjustments ({act_n})</a>")
+    if fills:
+        p(f"<a href='#' class='tabbtn' data-tab='tab-fills'>📋 Today's IBKR Fills ({len(fills)})</a>")
+    if os_strats:
+        p(f"<a href='#' class='tabbtn' data-tab='tab-optionstrat'>📱 OptionStrat Mirror ({len(os_strats)})</a>")
+    if flex:
+        p(f"<a href='#' class='tabbtn' data-tab='tab-flex'>📥 ONE Flex Import ({len(flex)})</a>")
+    p("</div>")
+
+    # --- TABPANEL 1: ACCOUNT RECONCILIATIONS ---
+    p("<div class='tabpanel active' data-tab='tab-reconcile'>")
     def problem(f):
         return f["status"] != "MATCH" and not f.get("acknowledged")
 
-    # grand totals (acknowledged excluded from diff tags; shown as ACK)
     grand = {s: 0 for s in ORDER}
     ack_total = 0
     for findings in result["accounts"].values():
@@ -552,10 +777,10 @@ def render_html() -> str:
         f"<span class='tag' style='background:{STATUS_COLORS[s]}'>{s} {grand[s]}</span>"
         for s in ORDER if grand[s])
     if ack_total:
-        tot += (f" &nbsp; <span class='tag' style='background:#57606a'>"
-                f"ACK {ack_total}</span>")
-    p(f"<div class='sub'>{tot}</div>")
+        tot += f" &nbsp; <span class='tag' style='background:#57606a'>ACK {ack_total}</span>"
+    p(f"<div class='sub' style='margin-bottom:10px;'>{tot}</div>")
 
+    p("<div class='grid-accts'>")
     for acct in sorted(result["accounts"]):
         findings = result["accounts"][acct]
         counts = {s: 0 for s in ORDER}
@@ -580,55 +805,82 @@ def render_html() -> str:
             p(f"<div class='muted'>All {counts['MATCH']} instruments reconcile."
               + (f" ({n_ack} acknowledged)" if n_ack else "") + "</div>")
         else:
-            p("<table><tr><th class='l'>instrument</th><th>IBKR qty</th>"
-              "<th>IBKR px</th><th>ONE qty</th><th>ONE px</th>"
-              "<th>&Delta;px</th><th class='l'>flag</th></tr>")
+            p("<div class='table-wrap'><table>"
+              "<tr><th class='l'>instrument</th><th>IBKR qty</th>"
+              "<th>IBKR px</th><th>ONE qty</th>"
+              "<th class='l'>flag</th></tr>")
             for f in flags:
                 iq = "" if f["ibkr_qty"] is None else f"{f['ibkr_qty']:+.0f}"
                 oq = "" if f["one_qty"] is None else f"{f['one_qty']:+.0f}"
-                ip = "" if f["ibkr_px"] is None else f"{f['ibkr_px']:.4f}"
-                op = "" if f["one_px"] is None else f"{f['one_px']:.4f}"
-                dpx = f"{f['px_delta']:+.4f}" if f.get("px_delta") not in (None,) and \
-                    f["status"] == "PRICE_DRIFT" else ""
-                color = STATUS_COLORS[f["status"]]
+                ip = "" if f["ibkr_px"] is None else f"{f['ibkr_px']:.2f}"
+                color = STATUS_COLORS.get(f["status"], "#8b949e")
+                tag_label = "MATCH (FIFO)" if f["status"] == "MATCH_FIFO_AVG" else f["status"]
+                tooltip = " title='Quantity matched. IBKR uses FIFO cost basis while ONE uses Weighted Avg entry.'" if f["status"] == "MATCH_FIFO_AVG" else ""
                 p(f"<tr><td class='l mono'>{html.escape(f['label'])}</td>"
                   f"<td class='mono'>{iq}</td><td class='mono'>{ip}</td>"
-                  f"<td class='mono'>{oq}</td><td class='mono'>{op}</td>"
-                  f"<td class='mono'>{dpx}</td>"
-                  f"<td class='l'><span class='tag' style='background:{color}'>"
-                  f"{f['status']}</span></td></tr>")
-            p("</table>")
+                  f"<td class='mono'>{oq}</td>"
+                  f"<td class='l'><span class='tag' style='background:{color}'{tooltip}>"
+                  f"{tag_label}</span></td></tr>")
+            p("</table></div>")
         if acked:
             p("<div class='muted' style='margin-top:6px'>Acknowledged (reviewed-OK):</div>")
-            p("<table>")
+            p("<div class='table-wrap'><table>")
             for f in acked:
-                ip = "" if f["ibkr_px"] is None else f"{f['ibkr_px']:.4f}"
-                op = "" if f["one_px"] is None else f"{f['one_px']:.4f}"
+                ip = "" if f["ibkr_px"] is None else f"{f['ibkr_px']:.2f}"
+                op = "" if f["one_px"] is None else f"{f['one_px']:.2f}"
                 p(f"<tr><td class='l mono muted'>{html.escape(f['label'])}</td>"
                   f"<td class='mono muted'>IBKR {ip}</td>"
                   f"<td class='mono muted'>ONE {op}</td>"
                   f"<td class='l'><span class='tag' style='background:#57606a'>"
                   f"ACK {html.escape(f['status'])}</span></td></tr>")
-            p("</table>")
+            p("</table></div>")
         p("</div>")
+    p("</div></div>") # close grid-accts AND close tabpanel tab-reconcile
 
-    # unmapped / ignored ONE groups
-    if result.get("unmapped_one_groups"):
-        ignore = set(result.get("ignore_one_accounts", []))
-        rows = " &nbsp; ".join(
-            f"{html.escape(g)}: {n}{' (ignored)' if g in ignore else ' <b class=warn>REVIEW</b>'}"
-            for g, n in result["unmapped_one_groups"].items())
-        p(f"<div class='acct'><h2>Unmapped ONE groups</h2><div class='muted'>{rows}</div></div>")
+    # --- TABPANEL 2: TRADE ADJUSTMENTS MODE ---
+    if act_n:
+        p("<div class='tabpanel' data-tab='tab-adj'>")
+        p("<div class='acct' style='border:2px solid #d29922;background:#3a2d0a;margin-bottom:12px'>"
+          "<h2 style='color:#f2cc60'>&#9888; ADJUSTMENT MODE &mdash; "
+          f"{act_n} change(s) since your last ONE export{exp_t}</h2>"
+          "<div class='muted' style='margin-bottom:8px'>Replicate these in ONE "
+          "(re-export &rarr; Check now) and edit the same-named OptionStrat combos."
+          "</div>")
 
-    # today's fills — tab per account, sortable columns
-    fills = result.get("fills_today", [])
+        p("<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;background:#161b22;padding:6px 10px;border-radius:6px;border:1px solid #30363d;'>"
+          "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap;'>"
+          "<span style='font-weight:600;font-size:12px;color:#f2cc60;'>Group / Sort by:</span>"
+          "<select id='adj-sort-by' onchange='window.renderAdjustments()' style='background:#0d1117;color:#e6edf3;border:1px solid #30363d;padding:3px 8px;border-radius:4px;font-size:12px;outline:none;'>"
+          "<option value='category'>📁 Category (Rolled &rarr; New &rarr; Closed &rarr; Adjusted)</option>"
+          "<option value='ticker'>🏷️ Ticker / Symbol (ADBE, RUT, SPX, UAL...)</option>"
+          "<option value='trade_id'>🆔 ONE Trade ID (Trade #74, #100, #115...)</option>"
+          "<option value='account'>🏦 Account ID (F244..., U232..., U455...)</option>"
+          "</select>"
+          "<div style='display:flex;gap:4px;margin-left:4px;'>"
+          "<button onclick='window.setAdjSort(\"category\")' style='background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:2px 8px;border-radius:4px;font-size:11px;cursor:pointer;'>Category</button>"
+          "<button onclick='window.setAdjSort(\"ticker\")' style='background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:2px 8px;border-radius:4px;font-size:11px;cursor:pointer;'>Ticker</button>"
+          "<button onclick='window.setAdjSort(\"trade_id\")' style='background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:2px 8px;border-radius:4px;font-size:11px;cursor:pointer;'>ONE Trade ID</button>"
+          "<button onclick='window.setAdjSort(\"account\")' style='background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:2px 8px;border-radius:4px;font-size:11px;cursor:pointer;'>Account</button>"
+          "</div>"
+          "</div>"
+          "<div style='display:flex;align-items:center;gap:6px;'>"
+          "<input type='text' id='adj-filter-search' oninput='window.renderAdjustments()' placeholder='🔍 Filter (e.g. SPX, #117, U455...)' style='background:#0d1117;color:#e6edf3;border:1px solid #30363d;padding:3px 8px;border-radius:4px;font-size:12px;width:180px;outline:none;' />"
+          "<button onclick='window.copyAdjustmentsText()' style='background:#238636;color:#ffffff;border:none;padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;cursor:pointer;' title='Copy checklist to clipboard'>📋 Copy</button>"
+          "</div>"
+          "</div>")
+
+        p("<div id='adj-content'></div></div></div>")
+        p(f"<script>window.ADJ_DATA = {json.dumps(adj_list)};</script>")
+
+    # --- TABPANEL 3: TODAY'S IBKR FILLS ---
     if fills:
+        p("<div class='tabpanel' data-tab='tab-fills'>")
+        p("<div class='acct'><h2>Today's IBKR Fills</h2>")
         by_acct: dict = defaultdict(list)
         for fl in fills:
             by_acct[str(fl.get("account", ""))].append(fl)
         accts = sorted(by_acct)
-        p(f"<div class='acct'><h2>Today's IBKR fills ({len(fills)})</h2>")
-        p("<div data-tabgroup='fills'><div class='tabnav'>")
+        p("<div data-tabgroup='fills-sub'><div class='tabnav' style='margin-bottom:6px;'>")
         for i, acct in enumerate(accts):
             p(f"<a href='#' class='tabbtn{' active' if i == 0 else ''}' "
               f"data-tab='{html.escape(acct)}'>{html.escape(acct)} "
@@ -637,7 +889,7 @@ def render_html() -> str:
         for i, acct in enumerate(accts):
             cls = "tabpanel active" if i == 0 else "tabpanel"
             p(f"<div class='{cls}' data-tab='{html.escape(acct)}'>")
-            p("<table class='sortable'><thead><tr>"
+            p("<div class='table-wrap'><table class='sortable'><thead><tr>"
               "<th class='l sortable'>time</th><th class='sortable'>side</th>"
               "<th class='sortable'>qty</th><th class='l sortable'>instrument</th>"
               "<th class='sortable'>price</th></tr></thead><tbody>")
@@ -653,21 +905,20 @@ def render_html() -> str:
                   f"<td class='mono' data-sort-value='{shares}'>{shares}</td>"
                   f"<td class='l mono'>{html.escape(lbl)}</td>"
                   f"<td class='mono' data-sort-value='{price}'>{price}</td></tr>")
-            p("</tbody></table></div>")
-        p("</div></div>")
+            p("</tbody></table></div></div>")
+        p("</div></div></div>")
 
-    # OptionStrat mirror: tab per account, per-combo current legs to keep your
-    # SAVED combos in sync
-    os_strats = st.get("os_strategies") or []
+    # --- TABPANEL 3: OPTIONSTRAT MIRROR ---
     if os_strats:
+        p("<div class='tabpanel' data-tab='tab-optionstrat'>")
+        p("<div class='acct'><h2>OptionStrat Mirror "
+          "<span class='muted'>edit your saved combo of the same name to match "
+          "these legs</span></h2>")
         by_acct = {}
         for s in os_strats:
             by_acct.setdefault(s["account"], []).append(s)
         accts = sorted(by_acct)
-        p("<div class='acct'><h2>OptionStrat mirror "
-          "<span class='muted'>edit your saved combo of the same name to match "
-          "these legs (keeps its P&amp;L)</span></h2>")
-        p("<div data-tabgroup='optionstrat'><div class='tabnav'>")
+        p("<div data-tabgroup='optionstrat-sub'><div class='tabnav' style='margin-bottom:6px;'>")
         for i, acct in enumerate(accts):
             p(f"<a href='#' class='tabbtn{' active' if i == 0 else ''}' "
               f"data-tab='{html.escape(acct)}'>{html.escape(acct)} "
@@ -681,37 +932,39 @@ def render_html() -> str:
                     f"<a href='{html.escape(u['url'])}' target='_blank' rel='noopener'>"
                     f"create new {html.escape(u['underlying'])} &#8599;</a>"
                     for u in s.get("create_urls", []))
-                p("<div style='margin:8px 0;padding:8px 10px;border:1px solid "
+                p("<div style='margin:6px 0;padding:6px 8px;border:1px solid "
                   "#30363d;border-radius:6px'>"
                   f"<div style='margin-bottom:4px'><b>{html.escape(s['name'])}</b> "
                   f"<span class='muted'>&middot; {len(s['legs'])} legs</span> "
                   f"<span class='muted' style='float:right'>{create}</span></div>")
-                p("<table>")
+                p("<div class='table-wrap'><table>")
                 for lg in s["legs"]:
                     side_col = "#3fb950" if lg["side"] == "Buy" else "#ff7b72"
                     p(f"<tr><td class='l' style='color:{side_col};width:48px'>"
                       f"{lg['side']}</td><td class='mono' style='width:40px'>"
                       f"{lg['qty']}</td><td class='l mono'>{html.escape(lg['label'])}</td>"
                       f"<td class='mono'>{lg['price']:.4f}</td></tr>")
-                p("</table></div>")
+                p("</table></div></div>")
             p("</div>")
-        p("</div></div>")
+        p("</div></div></div>")
 
-    # ONE Flex-import downloads (per account)
-    flex = st.get("flex") or {}
+    # --- TABPANEL 4: ONE FLEX IMPORT ---
     if flex:
+        p("<div class='tabpanel' data-tab='tab-flex'>")
         skipped = st.get("flex_skipped", 0)
-        p("<div class='acct'><h2>ONE Flex import "
+        p("<div class='acct'><h2>ONE Flex Import "
           f"<span class='muted'>today's fills &middot; {skipped} non-option skipped</span></h2>")
-        p("<table><tr><th class='l'>account</th><th>fill rows</th>"
+        p("<div class='table-wrap'><table><tr><th class='l'>account</th><th>fill rows</th>"
           "<th class='l'>download</th></tr>")
         for acct in sorted(flex):
             n = len(flex[acct])
             p(f"<tr><td class='l'>{html.escape(acct)}</td><td class='mono'>{n}</td>"
               f"<td class='l'><a href='/flex/{html.escape(acct)}.csv'>"
               f"ONEImport_{html.escape(acct)}.csv</a></td></tr>")
-        p("</table><div class='muted' style='margin-top:6px'>"
-          "Import into ONE (Flex Query format), then run ONE's link-trades step.</div></div>")
+        p("</table></div><div class='muted' style='margin-top:6px'>"
+          "Import into ONE (Flex Query format), then run ONE's link-trades step.</div></div></div>")
+
+    p("</div>")  # close main-dash tabgroup
 
     p("<div class='sub muted'>Auto-refreshes every 15s. IBKR truth is live; "
       "ONE updates when you re-export the Summary Report. See the "
@@ -911,6 +1164,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/check"):
             _check_now.set()
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
+        if self.path.startswith("/send_email"):
+            cfg = reconcile.load_config()
+            with _lock:
+                st = dict(_state)
+                result = st.get("result") or {}
+            ibkr_snap = {"legs": [], "fills_today": result.get("fills_today", [])}
+            one_snap = {"positions": []}
+            subject, html_body = email_report.generate_report_html(ibkr_snap, one_snap, cfg)
+            interactive_html = render_html()
+            success, msg = email_report.send_email(subject, html_body, cfg, attachment_html=interactive_html)
+            _set(status=msg)
             self.send_response(303)
             self.send_header("Location", "/")
             self.end_headers()

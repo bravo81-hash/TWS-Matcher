@@ -109,14 +109,37 @@ def build_fill_price_map(fills):
             for k, a in agg.items() if a["den"] > 0}
 
 
-def classify_activity(fills, ibkr_legs):
-    """Classify a set of option fills (vs the resulting current positions) into
-    rolled / opened / closed / adjusted, to guide ONE + OptionStrat updates.
+def _find_one_trade(acct, tc, exp, right, strike, und, one_legs, account_map):
+    if not one_legs:
+        return None
+    matching_trades = []
+    for l in one_legs:
+        one_acct = l.get("account")
+        mapped_ibkr = (account_map.get(one_acct) if account_map else None) or one_acct
+        if mapped_ibkr != acct:
+            continue
+        l_strike = float(l.get("strike") or 0)
+        l_right = l.get("right")
+        l_tc = l.get("tradingClass")
+        l_und = l.get("underlying")
+        tid = l.get("trade_id")
+        tname = l.get("trade_name") or (f"Trade #{tid}" if tid else "Open Trade")
 
-    For each leg: after = current net position; before = after - (net of these
-    fills). Then OPENED (0->x), CLOSED (x->0), ADDED / REDUCED (same sign), or
-    REVERSED. A CLOSED leg paired with an OPENED leg (same account+underlying+
-    right, equal qty) is reported as a ROLL (from -> to)."""
+        if l_right == right and abs(l_strike - strike) < 1e-4 and (l_tc == tc or l_und == und):
+            return {"trade_id": tid, "trade_name": tname, "match_type": "exact"}
+        if l_und == und or l_tc == tc:
+            matching_trades.append({"trade_id": tid, "trade_name": tname})
+
+    if matching_trades:
+        best = matching_trades[0]
+        return {"trade_id": best["trade_id"], "trade_name": best["trade_name"], "match_type": "combo"}
+    return None
+
+
+def classify_activity(fills, ibkr_legs, one_legs=None, account_map=None):
+    """Classify a set of option fills (vs the resulting current positions) into
+    rolled / opened / closed / adjusted, and map each to ONE Trade IDs to guide
+    ONE's import wizard."""
     today, meta = {}, {}
     for f in fills or []:
         if f.get("secType") not in (None, "OPT"):
@@ -148,9 +171,18 @@ def classify_activity(fills, ibkr_legs):
         after = cur.get(key, 0.0)
         before = after - net
         m = meta[key]
+        trade_match = _find_one_trade(acct, tc, exp, right, strike, m["underlying"],
+                                      one_legs, account_map)
+        hint = (f"Link to Trade #{trade_match['trade_id']} ({trade_match['trade_name']})"
+                if trade_match and trade_match.get("trade_id")
+                else "Select [New Trade] in ONE wizard")
+
         base = {"account": acct, "underlying": m["underlying"], "right": right,
+                "tradingClass": tc, "expiry": exp, "strike": strike,
                 "label": f"{tc} {_pretty_expiry(exp)} {strike:g}{right}",
-                "px": m["px"]}
+                "px": m["px"], "wizard_hint": hint,
+                "one_trade_id": trade_match.get("trade_id") if trade_match else None,
+                "one_trade_name": trade_match.get("trade_name") if trade_match else None}
         if abs(before) < 1e-9 and abs(after) > 1e-9:
             opened.append({**base, "type": "OPENED", "qty": after})
         elif abs(after) < 1e-9 and abs(before) > 1e-9:
@@ -173,8 +205,13 @@ def classify_activity(fills, ibkr_legs):
                     and abs(abs(c["qty"]) - abs(o["qty"])) < 1e-9):
                 used.add(i)
                 c["_paired"] = True
+                hint = c.get("wizard_hint") or o.get("wizard_hint")
                 rolled.append({"account": c["account"], "qty": abs(o["qty"]),
-                               "from": c["label"], "to": o["label"]})
+                               "from": c["label"], "to": o["label"],
+                               "underlying": c.get("underlying") or o.get("underlying"),
+                               "one_trade_id": c.get("one_trade_id") or o.get("one_trade_id"),
+                               "one_trade_name": c.get("one_trade_name") or o.get("one_trade_name"),
+                               "wizard_hint": hint})
                 break
     opened = [o for i, o in enumerate(opened) if i not in used]
     closed = [c for c in closed if not c.get("_paired")]
@@ -313,7 +350,7 @@ def _compare(ir, orow, expiry_dist, tol):
     if not qty_ok:
         status = "QTY_MISMATCH"
     elif not px_ok:
-        status = "PRICE_DRIFT"
+        status = "MATCH_FIFO_AVG"
     else:
         status = "MATCH"
     return {"status": status, "label": label_from_bucket(ir),
@@ -325,8 +362,8 @@ def _compare(ir, orow, expiry_dist, tol):
 
 
 # ----------------------------------------------------------------- reporting
-ORDER = ["QTY_MISMATCH", "ONE_ONLY", "IBKR_ONLY", "PRICE_DRIFT", "MATCH"]
-SYM = {"MATCH": "OK ", "PRICE_DRIFT": "~px", "QTY_MISMATCH": "!QTY",
+ORDER = ["QTY_MISMATCH", "ONE_ONLY", "IBKR_ONLY", "PRICE_DRIFT", "MATCH_FIFO_AVG", "MATCH"]
+SYM = {"MATCH": "OK ", "MATCH_FIFO_AVG": "~px(FIFO)", "PRICE_DRIFT": "~px", "QTY_MISMATCH": "!QTY",
        "IBKR_ONLY": ">IB", "ONE_ONLY": ">ONE"}
 
 

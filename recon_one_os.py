@@ -171,7 +171,7 @@ def diff_pair(one_c, os_c, tol):
             px_ok = _px_ok(o["price"], s["price"], tol)
             status = ("QTY_MISMATCH" if not qty_ok
                       else "PRICE_DIFF" if not px_ok else "MATCH")
-            if status != "MATCH":
+            if status == "QTY_MISMATCH":
                 ok = False
             legrows.append({"label": label, "status": status,
                             "one_qty": o["qty"], "one_px": o["price"],
