@@ -143,6 +143,16 @@ def run_cycle(ib: IB, cfg: dict):
     flex_by_acct, flex_skipped = flex_export.generate(
         ibkr_snap, cfg.get("flex_timezone"))
 
+    # Auto-save ONE Flex import CSV files into flex_export/ folder inside TWS Matcher
+    out_dir = os.path.join(HERE, "flex_export")
+    os.makedirs(out_dir, exist_ok=True)
+    for acct_id, rows in flex_by_acct.items():
+        csv_path = os.path.join(out_dir, f"ONEImport_{acct_id}.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh, quoting=csv.QUOTE_ALL)
+            w.writerow(flex_export.HEADER)
+            w.writerows(rows)
+
     # classify broker activity since the last ONE export (rolled/opened/closed/...)
     one_raw_legs = one_reader.read_summary_report(one_path) if (one_path and os.path.exists(one_path)) else []
     fills_since = [f for f in ibkr_snap.get("fills_today", [])
@@ -952,17 +962,22 @@ def render_html() -> str:
     if flex:
         p("<div class='tabpanel' data-tab='tab-flex'>")
         skipped = st.get("flex_skipped", 0)
+        out_folder = os.path.join(HERE, "flex_export")
         p("<div class='acct'><h2>ONE Flex Import "
           f"<span class='muted'>today's fills &middot; {skipped} non-option skipped</span></h2>")
+        p(f"<div class='sub' style='margin-bottom:8px;color:#3fb950;font-size:12.5px;'>"
+          f"📁 <b>Saved automatically to local folder:</b> <code class='mono' style='background:#21262d;padding:2px 6px;border-radius:4px;color:#e6edf3;'>{html.escape(out_folder)}</code>"
+          "</div>")
         p("<div class='table-wrap'><table><tr><th class='l'>account</th><th>fill rows</th>"
-          "<th class='l'>download</th></tr>")
+          "<th class='l'>local file path</th><th class='l'>download link</th></tr>")
         for acct in sorted(flex):
             n = len(flex[acct])
+            f_path = os.path.join(out_folder, f"ONEImport_{acct}.csv")
             p(f"<tr><td class='l'>{html.escape(acct)}</td><td class='mono'>{n}</td>"
-              f"<td class='l'><a href='/flex/{html.escape(acct)}.csv'>"
-              f"ONEImport_{html.escape(acct)}.csv</a></td></tr>")
+              f"<td class='l mono muted' style='font-size:11.5px;'>{html.escape(f_path)}</td>"
+              f"<td class='l'><a href='/flex/{html.escape(acct)}.csv' class='btn' style='font-size:11px;padding:2px 8px;text-decoration:none;'>⬇️ ONEImport_{html.escape(acct)}.csv</a></td></tr>")
         p("</table></div><div class='muted' style='margin-top:6px'>"
-          "Import into ONE (Flex Query format), then run ONE's link-trades step.</div></div></div>")
+          "Point ONE's import wizard directly to these files, then run ONE's link-trades step.</div></div></div>")
 
     p("</div>")  # close main-dash tabgroup
 
