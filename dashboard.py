@@ -38,6 +38,8 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
 from ib_async import IB
 
 import canonical_engine as eng
