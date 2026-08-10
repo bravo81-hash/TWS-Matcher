@@ -17,8 +17,12 @@ account it classifies every instrument as:
 
 Key handling (see memory account-mapping-and-expiry-offset):
   - ONE strategy groups are commingled into one IBKR account -> net them together.
-  - ONE's expiry runs 1-2 days later than IBKR's last-trade date -> match on
-    (tradingClass, right, strike) + NEAREST expiry within tolerances.expiry_days.
+  - ONE is netted on its listed expiry (one_reader.match_expiry), which leaves
+    only the AM-settled monthlies offset -- IBKR reports the Thursday last-trade
+    date, ONE the Friday expiration. So match on (tradingClass, right, strike) +
+    NEAREST expiry within tolerances.expiry_days, which needs to be only 1.
+    Keep it there: weekly SPXW expiries are >=2 days apart, so a 1-day window
+    cannot pair two genuinely different contracts at the same strike.
   - IBKR avg_price folds in commission -> small price tolerance.
   - Unmapped ONE groups (e.g. TimeZone/test) are reported under ONE_ONLY,
     tagged, unless listed in ignore_one_accounts.

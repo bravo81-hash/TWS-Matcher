@@ -31,7 +31,7 @@ def config():
         "tolerances": {
             "price_abs": 0.05,
             "price_pct": 0.005,
-            "expiry_days": 4,
+            "expiry_days": 1,
         },
         "email": {
             "enabled": True,
@@ -133,6 +133,47 @@ class ReconciliationTests(unittest.TestCase):
             config(),
         )
         self.assertEqual(result["unmapped_one_groups"], {"UnknownBook": 1})
+
+    def test_one_legs_are_netted_on_the_listed_expiry_not_the_osi_symbol(self):
+        """ONE's OSI symbol runs a day late; the Expiry column is the truth."""
+        leg = {
+            "account": "A14+HV7", "underlying": "SPX", "tradingClass": "SPXW",
+            "expiry": "20260822", "expiry_listed": "20260821",
+            "strike": 7400.0, "right": "P", "multiplier": 100.0,
+            "qty": -1.0, "open_price": 10.0, "is_open": True, "trade_id": "1",
+        }
+        [pos] = one_reader.net_positions([leg])
+        self.assertEqual(pos["expiry"], "20260821")
+        self.assertEqual(pos["expiry_osi"], "20260822")
+
+    def test_am_monthly_still_pairs_within_the_one_day_window(self):
+        """IBKR reports the Thursday last-trade date, ONE the Friday expiry."""
+        result = reconcile.reconcile_snapshots(
+            {"captured_at": "now", "fills_today": [], "legs": [
+                {**option(account="U1", qty=-1.0), "expiry": "20260917"}]},
+            {"source_file": "report.csv", "positions": [
+                {**option(qty=-1.0), "expiry": "20260918",
+                 "avg_price": 10.0}]},
+            config(),
+        )
+        [finding] = result["accounts"]["U1"]
+        self.assertEqual(finding["status"], "MATCH")
+        self.assertEqual(finding["expiry_offset_days"], 1)
+
+    def test_adjacent_weekly_expiries_do_not_cross_pair(self):
+        """A 1-day window must not marry a Wednesday leg to a Friday one."""
+        result = reconcile.reconcile_snapshots(
+            {"captured_at": "now", "fills_today": [], "legs": [
+                {**option(account="U1", qty=-1.0), "expiry": "20260819"}]},
+            {"source_file": "report.csv", "positions": [
+                {**option(qty=-1.0), "expiry": "20260821",
+                 "avg_price": 10.0}]},
+            config(),
+        )
+        self.assertEqual(
+            sorted(f["status"] for f in result["accounts"]["U1"]),
+            ["IBKR_ONLY", "ONE_ONLY"],
+        )
 
     def test_monthly_expiry_offset_does_not_mark_live_trade_closed(self):
         current = {

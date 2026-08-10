@@ -18,7 +18,8 @@ WHAT IT DOES
   - Signs qty: Buy = +, Sell = -.
   - Parses the OSI symbol -> tradingClass (SPX vs SPXW...), expiry, strike, right.
   - Nets legs by economic identity (account, tradingClass, expiry, strike, right)
-    into signed qty + qty-weighted avg price (ONE's commit price).
+    into signed qty + qty-weighted avg price (ONE's commit price). The expiry
+    used is ONE's listed one, not the OSI symbol's -- see match_expiry().
   - Writes one_positions.json in canonical shape.
 
 USAGE
@@ -90,6 +91,20 @@ def is_expired(expiry: str | None, as_of: date | None = None) -> bool:
         return False
     trading_date = as_of or datetime.now(US_EASTERN).date()
     return expiry_date < trading_date
+
+
+def match_expiry(leg: dict) -> str | None:
+    """The expiry a ONE leg should be reconciled on.
+
+    ONE carries two dates per leg: the one encoded in the OSI symbol, and the
+    ``Expiry`` column (``expiry_listed``) which is the real expiration.  The OSI
+    date runs a day late on most legs -- AM-settled monthlies encode the
+    Saturday, PM weeklies the Saturday after the Friday close -- so netting on
+    it forced a wide fuzzy-match window against IBKR's last-trade date.  The
+    listed expiry is the accurate one; fall back to the symbol only if ONE left
+    the column blank.
+    """
+    return leg.get("expiry_listed") or leg.get("expiry")
 
 
 def normalize_account_name(name: str | None) -> str:
@@ -278,13 +293,14 @@ def net_positions(legs: list[dict]) -> list[dict]:
     for lg in legs:
         if not lg["is_open"]:
             continue
-        key = (lg["account"], lg["tradingClass"], lg["expiry"],
+        key = (lg["account"], lg["tradingClass"], match_expiry(lg),
                lg["strike"], lg["right"])
         b = buckets.setdefault(key, {
             "account": lg["account"],
             "underlying": lg["underlying"],
             "tradingClass": lg["tradingClass"],
-            "expiry": lg["expiry"],
+            "expiry": match_expiry(lg),
+            "expiry_osi": lg["expiry"],
             "strike": lg["strike"],
             "right": lg["right"],
             "multiplier": lg["multiplier"],
@@ -307,7 +323,8 @@ def net_positions(legs: list[dict]) -> list[dict]:
             "account": b["account"],
             "underlying": b["underlying"],
             "tradingClass": b["tradingClass"],
-            "expiry": b["expiry"],
+            "expiry": b["expiry"],              # ONE's real expiration date
+            "expiry_osi": b["expiry_osi"],      # as encoded in the OSI symbol
             "strike": b["strike"],
             "right": b["right"],
             "multiplier": b["multiplier"],
