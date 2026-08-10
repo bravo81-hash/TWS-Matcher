@@ -146,7 +146,7 @@ def match_combos(one_list, os_list):
 
 def _px_ok(a, b, tol):
     if a is None or b is None:
-        return True                       # can't compare -> don't flag
+        return False                      # missing price means it was not verified
     return abs(a - b) <= tol
 
 
@@ -171,7 +171,7 @@ def diff_pair(one_c, os_c, tol):
             px_ok = _px_ok(o["price"], s["price"], tol)
             status = ("QTY_MISMATCH" if not qty_ok
                       else "PRICE_DIFF" if not px_ok else "MATCH")
-            if status == "QTY_MISMATCH":
+            if status != "MATCH":
                 ok = False
             legrows.append({"label": label, "status": status,
                             "one_qty": o["qty"], "one_px": o["price"],

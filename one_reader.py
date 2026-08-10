@@ -36,10 +36,12 @@ import os
 import re
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 # OSI: root letters, optional pad spaces, 6-digit yymmdd, C/P, 8-digit strike*1000
 OSI_RE = re.compile(r"^([A-Z]+)\s*(\d{6})([CP])(\d{8})$")
+ACCOUNT_ORDER_PREFIX_RE = re.compile(r"^\s*\d+\.\s*")
 
 # Equity-index options are all x100; keep a map in case ONE ever lists others.
 DEFAULT_MULTIPLIER = 100.0
@@ -52,6 +54,7 @@ EXPORT_GLOBS = ("*ONESummaryReport*.csv", "*ONEDetailReport*.csv")
 SAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                       "samples", "2026-06-24-ONESummaryReport.csv")
 OUTPUT_JSON = "one_positions.json"
+US_EASTERN = ZoneInfo("America/New_York")
 
 
 def _f(x, default=0.0):
@@ -70,6 +73,32 @@ def _parse_dmy(s: str):
         return datetime.strptime(s, "%d/%m/%Y").strftime("%Y%m%d")
     except ValueError:
         return None
+
+
+def is_expired(expiry: str | None, as_of: date | None = None) -> bool:
+    """Return whether an option expiry is before the current US trading date.
+
+    Expiry-day positions remain visible until that date has ended.  Using the
+    New York calendar also avoids hiding them early when the service runs from
+    Australia.
+    """
+    if not expiry:
+        return False
+    try:
+        expiry_date = datetime.strptime(str(expiry), "%Y%m%d").date()
+    except ValueError:
+        return False
+    trading_date = as_of or datetime.now(US_EASTERN).date()
+    return expiry_date < trading_date
+
+
+def normalize_account_name(name: str | None) -> str:
+    """Remove ONE's optional report-order prefix (for example ``1.SMSF``).
+
+    ONE adds these numeric prefixes when a report is grouped/sorted by Account.
+    They are presentation metadata, not part of the configured account name.
+    """
+    return ACCOUNT_ORDER_PREFIX_RE.sub("", str(name or "").strip())
 
 
 def parse_osi(symbol: str):
@@ -112,7 +141,7 @@ def parse_leg_row(row: list[str], cols: dict | None = None) -> dict | None:
         i = cols.get(name)
         return row[i] if (i is not None and i < len(row)) else ""
 
-    account = g("Account").strip()
+    account = normalize_account_name(g("Account"))
     trade_id = g("TradeId").strip()
     txn = g("Transaction").strip().lower()
     qty = _f(g("Qty"))
@@ -134,7 +163,11 @@ def parse_leg_row(row: list[str], cols: dict | None = None) -> dict | None:
     trading_class, expiry, right, strike = parsed
 
     signed = qty if txn == "buy" else -qty
-    is_open = close_date == ""               # closed legs carry a CloseDate
+    # Prefer ONE's listed expiry because an AM-settled monthly OSI symbol can
+    # carry the following Saturday.  ONE may leave an expired leg marked open;
+    # it is no longer an economic position and must not become ONE_ONLY.
+    expired = is_expired(expiry_listed or expiry)
+    is_open = close_date == "" and not expired
 
     return {
         "account": account,
@@ -149,6 +182,7 @@ def parse_leg_row(row: list[str], cols: dict | None = None) -> dict | None:
         "qty": signed,
         "open_price": avg_open,              # ONE's recorded per-share commit price
         "is_open": is_open,
+        "is_expired": expired,
         "symbol": symbol,
     }
 
@@ -324,17 +358,44 @@ def find_default_csv(search_dirs=None) -> str:
     return SAMPLE
 
 
+def extract_one_trades(legs: list[dict]) -> list[dict]:
+    """Group open ONE legs by (account, trade_id) to reconstruct active ONE trades."""
+    grouped = defaultdict(list)
+    for lg in legs:
+        if lg.get("is_open"):
+            grouped[(lg["account"], lg.get("trade_id"))].append(lg)
+
+    trades = []
+    for (acct, tid), tlegs in grouped.items():
+        name = next((l.get("trade_name") for l in tlegs if l.get("trade_name")),
+                    None) or (f"Trade #{tid}" if tid else "Open Trade")
+        und = next((l.get("underlying") for l in tlegs if l.get("underlying")),
+                   tlegs[0].get("tradingClass"))
+        trades.append({
+            "account": acct,
+            "trade_id": tid,
+            "trade_name": name,
+            "underlying": und,
+            "legs": tlegs,
+        })
+    return trades
+
+
 def build_one_snapshot(path: str) -> dict:
     """Read a ONE Summary Report CSV -> canonical ONE snapshot dict.
     Reused by the dashboard daemon (no console output / file write)."""
     legs = read_summary_report(path)
     positions = net_positions(legs)
+    trades = extract_one_trades(legs)
     return {
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "source": "ONE/SummaryReport",
         "source_file": path,
+        "source_mtime": os.path.getmtime(path) if os.path.exists(path) else None,
         "accounts": sorted({p["account"] for p in positions}),
         "positions": positions,
+        "trades": trades,
+        "raw_legs": legs,
     }
 
 
@@ -347,19 +408,23 @@ def main() -> None:
           f"{len(legs) - len(open_legs)} closed)")
 
     positions = net_positions(legs)
+    trades = extract_one_trades(legs)
     print_table(positions)
 
     snapshot = {
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "source": "ONE/SummaryReport",
         "source_file": path,
+        "source_mtime": os.path.getmtime(path) if os.path.exists(path) else None,
         "accounts": sorted({p["account"] for p in positions}),
         "positions": positions,
+        "trades": trades,
+        "raw_legs": legs,
     }
     with open(OUTPUT_JSON, "w") as fh:
         json.dump(snapshot, fh, indent=2, default=str)
     print(f"Wrote {OUTPUT_JSON}  ({len(positions)} net positions across "
-          f"{len(snapshot['accounts'])} accounts)")
+          f"{len(snapshot['accounts'])} accounts, {len(trades)} active ONE trades)")
 
 
 if __name__ == "__main__":

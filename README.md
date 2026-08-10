@@ -35,5 +35,15 @@ python dashboard.py
 Open <http://127.0.0.1:8787/>. The service refreshes automatically and also
 supports an on-demand **Check now** action.
 
+The dashboard address is intentionally local to the trading laptop. **Email
+Report** sends a frozen, self-contained reconciliation in the email body and as
+an attached HTML file; either can be opened on another computer without TWS,
+ONE, or access to the local dashboard.
+
+ONE report-order prefixes such as `1.A14+HV7` are normalized automatically.
+Broker-only stock and ETF holdings are shown as expected information because
+ONE models the option strategies, while option identity/quantity differences
+and current-fill price drift remain actionable.
+
 Generated snapshots, account configuration, broker exports, and Flex files are
 excluded from Git because they contain private trading data.

@@ -104,6 +104,8 @@ def collect_fills(ib: IB) -> list[dict]:
             "price": _f(getattr(e, "price", 0)),      # clean per-share fill price
             "commission": commission,                 # signed; None until report arrives
             "execId": getattr(e, "execId", None),
+            "orderId": getattr(e, "orderId", None),
+            "permId": getattr(e, "permId", None),
         })
     return out
 

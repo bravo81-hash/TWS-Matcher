@@ -62,7 +62,7 @@ ET = ZoneInfo("America/New_York")
 _lock = threading.Lock()
 _state: dict = {"status": "starting", "result": None, "error": None,
                 "last_cycle": None, "ibkr_connected": False, "one_file": None,
-                "one_mtime": None}
+                "one_mtime": None, "ibkr_snap": None, "one_snap": None}
 _check_now = threading.Event()
 
 
@@ -184,10 +184,12 @@ def run_cycle(ib: IB, cfg: dict):
     _set(status="ok", result=result, error=None,
          last_cycle=datetime.now(timezone.utc).isoformat(),
          one_file=one_path, one_mtime=one_mtime,
+         ibkr_snap=ibkr_snap, one_snap=one_snap,
          os_strategies=os_strategies,
          flex={a: rows for a, rows in flex_by_acct.items()},
          flex_skipped=flex_skipped,
          activity=activity,
+         account_codes=cfg.get("account_codes") or {},
          naming=naming_rows,
          oneos=oneos, oneos_file=os_path, oneos_mtime=os_mtime)
     # persist latest for other tools
@@ -233,6 +235,8 @@ PAGE_STYLE = (
     "table{border-collapse:collapse;width:100%}"
     "td,th{padding:3px 6px;text-align:right;border-bottom:1px solid #21262d;white-space:nowrap}"
     "td.l,th.l{text-align:left} .mono{font-variant-numeric:tabular-nums}"
+    ".adj-filter{background:#0d1117;color:#e6edf3;border:1px solid #30363d;"
+    "padding:3px 8px;border-radius:4px;font-size:12px;outline:none}"
     ".tag{font-weight:700;font-size:10.5px;padding:1px 5px;border-radius:4px;color:#fff;white-space:nowrap}"
     ".muted{color:#8b949e} a.btn{display:inline-block;background:#238636;color:#fff;"
     "padding:4px 10px;border-radius:5px;text-decoration:none;font-weight:600;font-size:12px}"
@@ -334,6 +338,11 @@ window.initAdjustments = function() {
   if (!sortBySelect || !window.ADJ_DATA) return;
 
   var savedSort = sessionStorage.getItem('adj_sort_by');
+  if (sessionStorage.getItem('adj_sort_version') !== '2') {
+    savedSort = 'time';
+    sessionStorage.setItem('adj_sort_by', savedSort);
+    sessionStorage.setItem('adj_sort_version', '2');
+  }
   if (savedSort && sortBySelect.querySelector('option[value="' + savedSort + '"]')) {
     sortBySelect.value = savedSort;
   }
@@ -343,6 +352,48 @@ window.initAdjustments = function() {
     qInput.value = savedQuery;
   }
 
+  var trades = window.TRADE_ADJ_DATA || [];
+  var flat = window.ADJ_DATA || [];
+  var unique = function(values) {
+    return Array.from(new Set(values.filter(function(v) {
+      return v !== null && v !== undefined && String(v).trim() !== '';
+    }).map(String))).sort(function(a, b) {
+      return a.localeCompare(b, undefined, {numeric:true});
+    });
+  };
+  var setOptions = function(id, values, allLabel) {
+    var select = document.getElementById(id);
+    if (!select) return;
+    var saved = sessionStorage.getItem(id) || '';
+    select.innerHTML = "<option value=''>" + allLabel + "</option>" +
+      unique(values).map(function(v) {
+        return "<option value='" + escapeHtml(v) + "'>" + escapeHtml(v) + "</option>";
+      }).join('');
+    if (saved && Array.from(select.options).some(function(o) { return o.value === saved; })) {
+      select.value = saved;
+    }
+  };
+  setOptions('adj-filter-ticker',
+    trades.flatMap(function(t) { return t.tickers || []; })
+      .concat(flat.map(function(i) { return i.ticker; })), 'All tickers');
+  setOptions('adj-filter-strike',
+    trades.flatMap(function(t) { return t.strikes || []; })
+      .concat(flat.flatMap(function(i) { return i.strikes || []; })), 'All strikes');
+  setOptions('adj-filter-trade',
+    trades.map(function(t) { return t.trade_id || '[New Trade]'; })
+      .concat(flat.map(function(i) { return i.trade_id || '[New Trade]'; })),
+    'All ONE trade IDs');
+  setOptions('adj-filter-account-type',
+    trades.map(function(t) { return t.account_type || 'Unclassified'; })
+      .concat(flat.map(function(i) { return i.account_type || 'Unclassified'; })),
+    'All account types');
+  setOptions('adj-filter-account',
+    trades.map(function(t) { return t.account; })
+      .concat(flat.map(function(i) { return i.account; })), 'All accounts');
+  setOptions('adj-filter-status',
+    trades.map(function(t) { return t.status_label || t.status; })
+      .concat(flat.map(function(i) { return i.category; })), 'All statuses');
+
   window.renderAdjustments();
 
   var wasFocused = sessionStorage.getItem('adj_filter_focused') === 'true';
@@ -351,6 +402,18 @@ window.initAdjustments = function() {
     var pos = qInput.value.length;
     try { qInput.setSelectionRange(pos, pos); } catch(e) {}
   }
+};
+
+window.clearAdjFilters = function() {
+  ['adj-filter-search', 'adj-filter-ticker', 'adj-filter-strike',
+   'adj-filter-trade', 'adj-filter-account-type', 'adj-filter-account',
+   'adj-filter-status'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.value = '';
+    sessionStorage.removeItem(id);
+  });
+  sessionStorage.removeItem('adj_filter_query');
+  window.renderAdjustments();
 };
 
 window.setAdjSort = function(mode) {
@@ -366,9 +429,10 @@ window.renderAdjustments = function() {
   var container = document.getElementById('adj-content');
   var sel = document.getElementById('adj-sort-by');
   var qInput = document.getElementById('adj-filter-search');
-  if (!container || !window.ADJ_DATA) return;
+  if (!container || (!window.ADJ_DATA && !window.TRADE_ADJ_DATA)) return;
 
-  var mode = sel ? sel.value : 'category';
+  var mode = sel ? sel.value : (sessionStorage.getItem('adj_sort_by') || 'time');
+  if (sel && sel.value !== mode) sel.value = mode;
   sessionStorage.setItem('adj_sort_by', mode);
 
   var rawQ = qInput ? qInput.value : '';
@@ -376,18 +440,141 @@ window.renderAdjustments = function() {
   var isFocused = (document.activeElement === qInput);
   sessionStorage.setItem('adj_filter_focused', isFocused ? 'true' : 'false');
 
-  var q = rawQ.toLowerCase().trim();
+  var qTerms = rawQ.toLowerCase().trim().split(/\s+/).filter(Boolean);
+  var filterValue = function(id) {
+    var el = document.getElementById(id);
+    var value = el ? el.value : '';
+    sessionStorage.setItem(id, value);
+    return value;
+  };
+  var filters = {
+    ticker: filterValue('adj-filter-ticker'),
+    strike: filterValue('adj-filter-strike'),
+    trade: filterValue('adj-filter-trade'),
+    accountType: filterValue('adj-filter-account-type'),
+    account: filterValue('adj-filter-account'),
+    status: filterValue('adj-filter-status')
+  };
+  var matches = function(item, isTrade) {
+    var tickers = isTrade ? (item.tickers || []) : [item.ticker];
+    var strikes = isTrade ? (item.strikes || []) : (item.strikes || []);
+    var tradeId = item.trade_id || '[New Trade]';
+    var accountType = item.account_type || 'Unclassified';
+    var status = isTrade ? (item.status_label || item.status) : item.category;
+    if (filters.ticker && tickers.map(String).indexOf(filters.ticker) === -1) return false;
+    if (filters.strike && strikes.map(String).indexOf(filters.strike) === -1) return false;
+    if (filters.trade && String(tradeId) !== filters.trade) return false;
+    if (filters.accountType && String(accountType) !== filters.accountType) return false;
+    if (filters.account && String(item.account) !== filters.account) return false;
+    if (filters.status && String(status) !== filters.status) return false;
+    var haystack = JSON.stringify(item).toLowerCase();
+    return qTerms.every(function(term) { return haystack.indexOf(term) !== -1; });
+  };
 
-  var items = window.ADJ_DATA.filter(function(item) {
-    if (!q) return true;
-    var searchStr = (item.account + ' ' + item.category + ' ' + item.ticker + ' ' +
-                     item.label + ' ' + item.trade_id_str + ' ' + item.trade_name + ' ' +
-                     item.wizard_hint).toLowerCase();
-    return searchStr.indexOf(q) !== -1;
+  // Trade cards, ordered by broker execution time by default.
+  if ((mode === 'time' || mode === 'trade_id') && window.TRADE_ADJ_DATA && window.TRADE_ADJ_DATA.length > 0) {
+    var trades = window.TRADE_ADJ_DATA.filter(function(t) {
+      return matches(t, true);
+    });
+    trades.sort(function(a, b) {
+      if (mode === 'trade_id') {
+        var aId = a.trade_id === null || a.trade_id === undefined ? Number.MAX_SAFE_INTEGER : Number(a.trade_id);
+        var bId = b.trade_id === null || b.trade_id === undefined ? Number.MAX_SAFE_INTEGER : Number(b.trade_id);
+        if (aId !== bId) return aId - bId;
+      }
+      return Number(b.timestamp_epoch || 0) - Number(a.timestamp_epoch || 0);
+    });
+
+    if (trades.length === 0) {
+      container.innerHTML = "<div class='muted' style='padding:6px 0;'>No adjustments match all selected filters.</div>";
+      return;
+    }
+
+    var html = [];
+    trades.forEach(function(t) {
+      var badgeColor = '#58a6ff';
+      if (t.status === 'ROLLED' || t.status === 'ADJUSTED') badgeColor = '#d29922';
+      else if (t.status === 'NEW_TRADE') badgeColor = '#3fb950';
+      else if (t.status === 'TRADE_CLOSED' || t.status === 'LEG_CLOSED') badgeColor = '#ff7b72';
+
+      var tTitle = t.trade_id ? ('ONE Trade #' + t.trade_id + (t.trade_name ? ' (' + t.trade_name + ')' : '')) : ('[New Trade] ' + (t.trade_name || ''));
+      var timeStr = "";
+      if (t.timestamp) {
+        var parsedTime = new Date(t.timestamp);
+        var displayTime = isNaN(parsedTime.getTime()) ? t.timestamp : parsedTime.toLocaleString();
+        timeStr = " <span class='muted' style='font-weight:normal;font-size:11px;' title='" +
+          escapeHtml(t.timestamp) + "'>Executed " + escapeHtml(displayTime) + "</span>";
+      }
+      var accountType = t.account_type ? " <span class='tag' style='background:#57606a;margin-left:5px;'>" +
+        escapeHtml(t.account_type) + "</span>" : "";
+
+      html.push("<div style='border:1px solid #30363d;border-radius:6px;padding:8px 12px;margin-bottom:10px;background:#161b22;'>");
+      html.push("<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;'>");
+      html.push("<div><span style='font-weight:700;color:#e6edf3;font-size:13px;'>[" + escapeHtml(t.account) + "] " + escapeHtml(tTitle) + "</span>" + accountType + timeStr + "</div>");
+      html.push("<span class='tag' style='background:" + badgeColor + ";font-weight:600;'>" + escapeHtml(t.status_label || t.status) + "</span>");
+      html.push("</div>");
+
+      html.push("<div class='table-wrap'><table style='table-layout:fixed;width:100%;'>");
+      html.push("<colgroup><col style='width:120px;'><col style='width:auto;'><col style='width:105px;'></colgroup>");
+
+      (t.rolled || []).forEach(function(r) {
+        html.push("<tr>");
+        html.push("<td style='color:#d29922;font-weight:600;'>🔄 Rolled</td>");
+        html.push("<td class='l mono' style='color:#d29922;'>" + escapeHtml(r.from) + " &rarr; " + escapeHtml(r.to) + "</td>");
+        html.push("<td class='mono' style='text-align:right;color:#d29922;'>x" + escapeHtml(r.qty) + "</td>");
+        html.push("</tr>");
+      });
+
+      (t.opened || []).forEach(function(o) {
+        var pxStr = (o.px !== null && o.px !== undefined) ? (" @ " + Number(o.px).toFixed(4)) : "";
+        html.push("<tr>");
+        html.push("<td style='color:#3fb950;font-weight:600;'>➕ Leg Opened</td>");
+        html.push("<td class='l mono' style='color:#3fb950;'>" + escapeHtml(o.label) + "</td>");
+        html.push("<td class='mono' style='text-align:right;color:#3fb950;'>" + (o.qty > 0 ? '+' : '') + escapeHtml(o.qty) + pxStr + "</td>");
+        html.push("</tr>");
+      });
+
+      (t.closed || []).forEach(function(c) {
+        html.push("<tr>");
+        html.push("<td style='color:#ff7b72;font-weight:600;'>❌ Leg Closed</td>");
+        html.push("<td class='l mono' style='color:#ff7b72;'>" + escapeHtml(c.label) + "</td>");
+        html.push("<td class='mono' style='text-align:right;color:#ff7b72;'>was " + (c.qty > 0 ? '+' : '') + escapeHtml(c.qty) + "</td>");
+        html.push("</tr>");
+      });
+
+      (t.changed || []).forEach(function(ch) {
+        html.push("<tr>");
+        html.push("<td style='color:#d29922;font-weight:600;'>⚡ Adjusted</td>");
+        html.push("<td class='l mono' style='color:#d29922;'>" + escapeHtml(ch.label) + " (" + escapeHtml(ch.type ? ch.type.toLowerCase() : '') + ")</td>");
+        html.push("<td class='mono' style='text-align:right;color:#d29922;'>" + (ch.qty > 0 ? '+' : '') + escapeHtml(ch.qty) + "</td>");
+        html.push("</tr>");
+      });
+
+      html.push("</table></div>");
+
+      if (t.wizard_hint) {
+        html.push("<div style='margin-top:6px;padding:4px 8px;background:#0d1117;border-radius:4px;border:1px solid #21262d;font-size:12px;'>");
+        html.push("<span style='color:#58a6ff;font-weight:600;'>👉 ONE Wizard:</span> <span style='color:#e6edf3;'>" + escapeHtml(t.wizard_hint) + "</span>");
+        html.push("</div>");
+      }
+
+      html.push("</div>");
+    });
+
+    container.innerHTML = html.join('');
+    return;
+  }
+
+  // Grouped modes use flat adjustment rows and keep each group newest-first.
+  var items = (window.ADJ_DATA || []).filter(function(item) {
+    return matches(item, false);
+  });
+  items.sort(function(a, b) {
+    return Number(b.timestamp_epoch || 0) - Number(a.timestamp_epoch || 0);
   });
 
   if (items.length === 0) {
-    container.innerHTML = "<div class='muted' style='padding:6px 0;'>No matching adjustments found for search query.</div>";
+    container.innerHTML = "<div class='muted' style='padding:6px 0;'>No adjustments match all selected filters.</div>";
     return;
   }
 
@@ -401,9 +588,6 @@ window.renderAdjustments = function() {
     if (mode === 'ticker') {
       gKey = item.ticker || 'Other';
       gTitle = 'Ticker: ' + gKey;
-    } else if (mode === 'trade_id') {
-      gKey = item.trade_id ? ('Trade #' + item.trade_id) : '[New Trade]';
-      gTitle = item.trade_id ? ('ONE Trade #' + item.trade_id + (item.trade_name ? ' (' + item.trade_name + ')' : '')) : 'ONE Wizard: Select [New Trade]';
     } else if (mode === 'account') {
       gKey = item.account || 'Unknown';
       gTitle = 'Account: ' + gKey;
@@ -422,10 +606,6 @@ window.renderAdjustments = function() {
   groupOrder.sort(function(a, b) {
     if (mode === 'category') {
       return groups[a].order - groups[b].order;
-    } else if (mode === 'trade_id') {
-      var numA = parseInt(a.replace(/\D/g, '')) || 999999;
-      var numB = parseInt(b.replace(/\D/g, '')) || 999999;
-      return numA - numB;
     } else {
       return a.localeCompare(b);
     }
@@ -446,10 +626,13 @@ window.renderAdjustments = function() {
     html.push("</div>");
 
     html.push("<div class='table-wrap'><table style='table-layout:fixed;width:100%;'>");
-    html.push("<colgroup><col style='width:90px;'><col style='width:auto;'><col style='width:105px;'></colgroup>");
+    html.push("<colgroup><col style='width:145px;'><col style='width:90px;'><col style='width:auto;'><col style='width:105px;'></colgroup>");
     grp.items.forEach(function(r) {
       var hintHtml = r.wizard_hint ? " &nbsp;<span style='color:#58a6ff;font-size:11.5px'>👉 " + escapeHtml(r.wizard_hint) + "</span>" : "";
+      var parsedTime = r.timestamp ? new Date(r.timestamp) : null;
+      var rowTime = parsedTime && !isNaN(parsedTime.getTime()) ? parsedTime.toLocaleString() : (r.timestamp || '');
       html.push("<tr>");
+      html.push("<td class='l mono muted' title='" + escapeHtml(r.timestamp || '') + "'>" + escapeHtml(rowTime) + "</td>");
       html.push("<td class='l' style='width:90px;font-weight:600;color:#e6edf3;'>" + escapeHtml(r.account) + "</td>");
       html.push("<td class='l mono' style='color:" + r.color + ";'>" + r.details_html + hintHtml + "</td>");
       html.push("<td class='mono' style='width:105px;text-align:right;'>" + escapeHtml(r.qty_str) + "</td>");
@@ -462,17 +645,42 @@ window.renderAdjustments = function() {
 };
 
 window.copyAdjustmentsText = function() {
-  if (!window.ADJ_DATA) return;
-  var lines = ["=== TWS Matcher - Today's Trade Adjustments Checklist ==="];
-  window.ADJ_DATA.forEach(function(r) {
-    lines.push("[" + r.account + "] " + r.category.toUpperCase() + ": " + r.label + " | " + r.qty_str + " | " + r.wizard_hint);
-  });
-  var text = lines.join("\n");
-  navigator.clipboard.writeText(text).then(function() {
-    alert("Copied " + window.ADJ_DATA.length + " adjustment item(s) to clipboard!");
-  }).catch(function(err) {
-    console.error("Copy failed", err);
-  });
+  if (window.TRADE_ADJ_DATA && window.TRADE_ADJ_DATA.length > 0) {
+    var lines = ["=== TWS Matcher - Today's Trade Adjustments Checklist ==="];
+    window.TRADE_ADJ_DATA.forEach(function(t) {
+      var header = "[" + t.account + "] " + (t.trade_id ? ("Trade #" + t.trade_id + " (" + t.trade_name + ")") : "[New Trade]") + " - " + t.status_label;
+      lines.push("\n" + header);
+      (t.rolled || []).forEach(function(r) {
+        lines.push("  * ROLLED: " + r.from + " -> " + r.to + " (x" + r.qty + ")");
+      });
+      (t.opened || []).forEach(function(o) {
+        lines.push("  * OPENED: " + o.label + " (" + (o.qty > 0 ? '+' : '') + o.qty + ")");
+      });
+      (t.closed || []).forEach(function(c) {
+        lines.push("  * CLOSED: " + c.label + " (was " + c.qty + ")");
+      });
+      if (t.wizard_hint) {
+        lines.push("  -> HINT: " + t.wizard_hint);
+      }
+    });
+    var text = lines.join("\n");
+    navigator.clipboard.writeText(text).then(function() {
+      alert("Copied trade adjustments checklist to clipboard!");
+    }).catch(function(err) {
+      console.error("Copy failed", err);
+    });
+  } else if (window.ADJ_DATA) {
+    var lines = ["=== TWS Matcher - Today's Trade Adjustments Checklist ==="];
+    window.ADJ_DATA.forEach(function(r) {
+      lines.push("[" + r.account + "] " + r.category.toUpperCase() + ": " + r.label + " | " + r.qty_str + " | " + r.wizard_hint);
+    });
+    var text = lines.join("\n");
+    navigator.clipboard.writeText(text).then(function() {
+      alert("Copied " + window.ADJ_DATA.length + " adjustment item(s) to clipboard!");
+    }).catch(function(err) {
+      console.error("Copy failed", err);
+    });
+  }
 };
 
 function escapeHtml(str) {
@@ -605,21 +813,29 @@ def render_html() -> str:
     act_n = sum(len(act.get(k, [])) for k in ("rolled", "opened", "closed", "changed"))
 
     def _alerting(f):
-        # actionable = real divergence, not acknowledged, not an expected
-        # stock-only-in-IBKR line (ONE never models stocks, so those are noise).
-        if f["status"] in ("MATCH", "MATCH_FIFO_AVG") or f.get("acknowledged"):
-            return False
-        if f["status"] == "IBKR_ONLY" and str(f.get("label", "")).endswith("(STK)"):
-            return False
-        return True
+        return reconcile.is_actionable_finding(f)
 
-    prob_n = (sum(1 for finds in result["accounts"].values() for f in finds
-                  if _alerting(f)) if result else 0)
+    ignored_groups = set((result or {}).get("ignore_one_accounts", []))
+    unmapped = (result or {}).get("unmapped_one_groups", {})
+    active_unmapped = {
+        name: count for name, count in unmapped.items()
+        if one_reader.normalize_account_name(name) not in ignored_groups
+    }
+    one_stale = bool(
+        st.get("one_mtime")
+        and time.time() - st["one_mtime"] > 3600
+    )
+    prob_n = (
+        sum(1 for finds in result["accounts"].values() for f in finds
+            if _alerting(f))
+        + sum(active_unmapped.values())
+        if result else 0
+    )
     if not result:
         title = "TWS Matcher"
     elif act_n:
         title = f"⚠{act_n} · TWS Matcher"        # broker activity since export
-    elif prob_n:
+    elif prob_n or one_stale:
         title = f"⚠{prob_n} · TWS Matcher"       # structural diffs
     else:
         title = "✓ TWS Matcher"                       # all in sync
@@ -637,11 +853,17 @@ def render_html() -> str:
       f"&nbsp;|&nbsp; <a class='btn' href='/check'>Check now</a> "
       f"&nbsp;|&nbsp; <a class='btn' style='background:#1f6feb' href='/send_email'>📧 Email Report</a></div>")
 
-    if result and prob_n == 0:
+    if result and prob_n == 0 and not one_stale:
         p("<div class='acct' style='border:2px solid #238636;background:#0d2818;margin-bottom:14px'>"
           "<h2 style='color:#3fb950;margin:0 0 4px'>🟢 ALL POSITIONS MATCHED &mdash; IBKR TRUTH IN SYNC</h2>"
           "<div class='muted'>Zero unhedged legs and zero quantity mismatches across all accounts. Position sizing is 100% aligned.</div>"
           "</div>")
+    elif result and prob_n == 0 and one_stale:
+        p("<div class='acct' style='border:2px solid #d29922;background:#2d250d;margin-bottom:14px'>"
+          "<h2 style='color:#f2cc60;margin:0 0 4px'>POSITION STRUCTURE MATCHES, "
+          "BUT THE ONE EXPORT IS STALE</h2>"
+          "<div class='muted'>Export a fresh open-position report from ONE and "
+          "click Check now before relying on this assurance.</div></div>")
 
     if st.get("error"):
         p(f"<div class='acct' style='border-color:#cf222e'><b class='warn'>"
@@ -661,13 +883,35 @@ def render_html() -> str:
           "Report found in the configured folders. Export from ONE to Downloads "
           "or Documents.</div>")
     else:
-        stale = (st.get("one_mtime") and (time.time() - st["one_mtime"]) > 3600)
-        warn = " <span class='warn'>(stale &mdash; re-export from ONE)</span>" if stale else ""
+        warn = (" <span class='warn'>(stale &mdash; re-export from ONE)</span>"
+                if one_stale else "")
         p(f"<div class='sub'>ONE export: {html.escape(one_file)} &middot; "
           f"{one_age}{warn}</div>")
 
+    if active_unmapped:
+        group_text = ", ".join(
+            f"{html.escape(name)} ({count} legs)"
+            for name, count in sorted(active_unmapped.items())
+        )
+        p("<div class='acct' style='border:2px solid #cf222e;background:#2d1117'>"
+          "<b class='warn'>Unmapped ONE account group(s):</b> "
+          f"{group_text}. Add these groups to config.json before trusting the "
+          "reconciliation.</div>")
+
     # -------- BUILD ADJUSTMENT DATA OBJECTS --------
     adj_list = []
+    account_codes = st.get("account_codes") or {}
+
+    def account_type(account):
+        return str(account_codes.get(str(account), ""))
+
+    def timestamp_fields(item):
+        timestamp = item.get("timestamp")
+        return {
+            "timestamp": timestamp,
+            "timestamp_epoch": _fill_epoch(timestamp) or 0,
+        }
+
     exp_t = ""
     if act_n:
         if st.get("one_mtime"):
@@ -680,9 +924,11 @@ def render_html() -> str:
                 hint = r.get("wizard_hint", "")
                 adj_list.append({
                     "account": str(r.get("account", "")),
+                    "account_type": account_type(r.get("account", "")),
                     "category": "Rolled",
                     "category_order": 1,
                     "ticker": r.get("underlying") or str(r.get("from", "")).split()[0],
+                    "strikes": [s for s in (r.get("from_strike"), r.get("to_strike")) if s is not None],
                     "label": f"{r['from']} -> {r['to']}",
                     "trade_id": tid,
                     "trade_id_str": f"Trade #{tid}" if tid else "[New Trade]",
@@ -690,7 +936,8 @@ def render_html() -> str:
                     "wizard_hint": hint,
                     "qty_str": f"x{r['qty']:.0f}",
                     "color": "#d29922",
-                    "details_html": f"{html.escape(r['from'])} &rarr; {html.escape(r['to'])}"
+                    "details_html": f"{html.escape(r['from'])} &rarr; {html.escape(r['to'])}",
+                    **timestamp_fields(r),
                 })
 
         if act.get("opened"):
@@ -700,9 +947,11 @@ def render_html() -> str:
                 hint = o.get("wizard_hint", "")
                 adj_list.append({
                     "account": str(o.get("account", "")),
+                    "account_type": account_type(o.get("account", "")),
                     "category": "New / opened",
                     "category_order": 2,
                     "ticker": o.get("underlying") or str(o.get("label", "")).split()[0],
+                    "strikes": [o["strike"]] if o.get("strike") is not None else [],
                     "label": o.get("label", ""),
                     "trade_id": tid,
                     "trade_id_str": f"Trade #{tid}" if tid else "[New Trade]",
@@ -710,7 +959,8 @@ def render_html() -> str:
                     "wizard_hint": hint,
                     "qty_str": f"{o['qty']:+.0f} @ {o['px']:.4f}",
                     "color": "#3fb950",
-                    "details_html": html.escape(o.get("label", ""))
+                    "details_html": html.escape(o.get("label", "")),
+                    **timestamp_fields(o),
                 })
 
         if act.get("closed"):
@@ -720,9 +970,11 @@ def render_html() -> str:
                 hint = c.get("wizard_hint", "")
                 adj_list.append({
                     "account": str(c.get("account", "")),
+                    "account_type": account_type(c.get("account", "")),
                     "category": "Closed",
                     "category_order": 3,
                     "ticker": c.get("underlying") or str(c.get("label", "")).split()[0],
+                    "strikes": [c["strike"]] if c.get("strike") is not None else [],
                     "label": c.get("label", ""),
                     "trade_id": tid,
                     "trade_id_str": f"Trade #{tid}" if tid else "[New Trade]",
@@ -730,7 +982,8 @@ def render_html() -> str:
                     "wizard_hint": hint,
                     "qty_str": f"was {c['qty']:+.0f}",
                     "color": "#ff7b72",
-                    "details_html": html.escape(c.get("label", ""))
+                    "details_html": html.escape(c.get("label", "")),
+                    **timestamp_fields(c),
                 })
 
         if act.get("changed"):
@@ -740,9 +993,11 @@ def render_html() -> str:
                 hint = ch.get("wizard_hint", "")
                 adj_list.append({
                     "account": str(ch.get("account", "")),
+                    "account_type": account_type(ch.get("account", "")),
                     "category": "Adjusted",
                     "category_order": 4,
                     "ticker": ch.get("underlying") or str(ch.get("label", "")).split()[0],
+                    "strikes": [ch["strike"]] if ch.get("strike") is not None else [],
                     "label": f"{ch.get('label', '')} ({ch.get('type', '').lower()})",
                     "trade_id": tid,
                     "trade_id_str": f"Trade #{tid}" if tid else "[New Trade]",
@@ -750,8 +1005,40 @@ def render_html() -> str:
                     "wizard_hint": hint,
                     "qty_str": f"{ch['qty']:+.0f}",
                     "color": "#d29922",
-                    "details_html": f"{html.escape(ch.get('label', ''))} ({html.escape(ch.get('type', '').lower())})"
+                    "details_html": f"{html.escape(ch.get('label', ''))} ({html.escape(ch.get('type', '').lower())})",
+                    **timestamp_fields(ch),
                 })
+
+    trade_adj_list = []
+    for trade in act.get("by_trade", []):
+        item = dict(trade)
+        tickers = set()
+        strikes = set()
+        if trade.get("underlying"):
+            tickers.add(str(trade["underlying"]))
+        for leg in (
+            list(trade.get("opened") or [])
+            + list(trade.get("closed") or [])
+            + list(trade.get("changed") or [])
+        ):
+            if leg.get("underlying"):
+                tickers.add(str(leg["underlying"]))
+            if leg.get("strike") is not None:
+                strikes.add(float(leg["strike"]))
+        for roll in trade.get("rolled") or []:
+            if roll.get("underlying"):
+                tickers.add(str(roll["underlying"]))
+            for key in ("from_strike", "to_strike"):
+                if roll.get(key) is not None:
+                    strikes.add(float(roll[key]))
+        item.update({
+            "account_type": account_type(trade.get("account", "")),
+            "tickers": sorted(tickers),
+            "strikes": sorted(strikes),
+            **timestamp_fields(trade),
+        })
+        trade_adj_list.append(item)
+    trade_adj_list.sort(key=lambda item: item["timestamp_epoch"], reverse=True)
 
     # -------- MAIN DASHBOARD TAB GROUP --------
     fills = result.get("fills_today", [])
@@ -775,14 +1062,17 @@ def render_html() -> str:
     # --- TABPANEL 1: ACCOUNT RECONCILIATIONS ---
     p("<div class='tabpanel active' data-tab='tab-reconcile'>")
     def problem(f):
-        return f["status"] != "MATCH" and not f.get("acknowledged")
+        return reconcile.is_actionable_finding(f)
 
     grand = {s: 0 for s in ORDER}
     ack_total = 0
+    expected_total = 0
     for findings in result["accounts"].values():
         for f in findings:
             if f.get("acknowledged"):
                 ack_total += 1
+            elif reconcile.is_expected_finding(f):
+                expected_total += 1
             else:
                 grand[f["status"]] = grand.get(f["status"], 0) + 1
     tot = " &nbsp; ".join(
@@ -790,6 +1080,9 @@ def render_html() -> str:
         for s in ORDER if grand[s])
     if ack_total:
         tot += f" &nbsp; <span class='tag' style='background:#57606a'>ACK {ack_total}</span>"
+    if expected_total:
+        tot += (f" &nbsp; <span class='tag' style='background:#57606a'>"
+                f"EXPECTED STOCK/ETF {expected_total}</span>")
     p(f"<div class='sub' style='margin-bottom:10px;'>{tot}</div>")
 
     p("<div class='grid-accts'>")
@@ -797,16 +1090,25 @@ def render_html() -> str:
         findings = result["accounts"][acct]
         counts = {s: 0 for s in ORDER}
         for f in findings:
-            if not f.get("acknowledged"):
+            if not f.get("acknowledged") and not reconcile.is_expected_finding(f):
                 counts[f["status"]] += 1
-        clean = all(counts[s] == 0 for s in
-                    ("QTY_MISMATCH", "ONE_ONLY", "IBKR_ONLY", "PRICE_DRIFT"))
+        clean = not any(problem(f) for f in findings)
         pill = ("<span class='pill MATCHpill'>MATCH</span>" if clean
                 else "<span class='pill DIFFpill'>DIFF</span>")
-        summ = " ".join(f"{s}:{counts[s]}" for s in ORDER if counts[s])
+        expected = [f for f in findings if reconcile.is_expected_finding(f)]
+        basis_info = [f for f in findings
+                      if f["status"] == "MATCH_FIFO_AVG"
+                      and not f.get("acknowledged")]
+        summ_parts = [f"{s}:{counts[s]}" for s in ORDER
+                      if counts[s] and s != "MATCH_FIFO_AVG"]
+        if basis_info:
+            summ_parts.append(f"COST_BASIS_INFO:{len(basis_info)}")
+        if expected:
+            summ_parts.append(f"EXPECTED_HOLDINGS:{len(expected)}")
         n_ack = sum(1 for f in findings if f.get("acknowledged"))
         if n_ack:
-            summ += f" ACK:{n_ack}"
+            summ_parts.append(f"ACK:{n_ack}")
+        summ = " ".join(summ_parts)
         p(f"<div class='acct'><h2><span>{html.escape(acct)} "
           f"<span class='muted'>{html.escape(summ)}</span></span>{pill}</h2>")
 
@@ -814,7 +1116,8 @@ def render_html() -> str:
                        key=lambda f: ORDER.index(f["status"]))
         acked = [f for f in findings if f.get("acknowledged")]
         if not flags:
-            p(f"<div class='muted'>All {counts['MATCH']} instruments reconcile."
+            p(f"<div class='muted'>All {counts['MATCH'] + len(basis_info)} "
+              "modeled option instruments reconcile on identity and quantity."
               + (f" ({n_ack} acknowledged)" if n_ack else "") + "</div>")
         else:
             p("<div class='table-wrap'><table>"
@@ -834,6 +1137,27 @@ def render_html() -> str:
                   f"<td class='l'><span class='tag' style='background:{color}'{tooltip}>"
                   f"{tag_label}</span></td></tr>")
             p("</table></div>")
+        if basis_info:
+            p(f"<details class='muted' style='margin-top:6px'><summary>"
+              f"{len(basis_info)} quantity-matched cost-basis difference(s) "
+              "(IBKR FIFO versus ONE weighted average)</summary>"
+              "<div class='table-wrap'><table><tr><th class='l'>instrument</th>"
+              "<th>IBKR px</th><th>ONE px</th></tr>")
+            for f in basis_info:
+                p(f"<tr><td class='l mono'>{html.escape(f['label'])}</td>"
+                  f"<td class='mono'>{f['ibkr_px']:.4f}</td>"
+                  f"<td class='mono'>{f['one_px']:.4f}</td></tr>")
+            p("</table></div></details>")
+        if expected:
+            p(f"<details class='muted' style='margin-top:6px'><summary>"
+              f"{len(expected)} expected broker-only stock/ETF holding(s), "
+              "excluded because ONE models options only</summary>"
+              "<div class='table-wrap'><table><tr><th class='l'>holding</th>"
+              "<th>IBKR qty</th></tr>")
+            for f in expected:
+                p(f"<tr><td class='l mono'>{html.escape(f['label'])}</td>"
+                  f"<td class='mono'>{f['ibkr_qty']:+.0f}</td></tr>")
+            p("</table></div></details>")
         if acked:
             p("<div class='muted' style='margin-top:6px'>Acknowledged (reviewed-OK):</div>")
             p("<div class='table-wrap'><table>")
@@ -852,8 +1176,8 @@ def render_html() -> str:
     # --- TABPANEL 2: TRADE ADJUSTMENTS MODE ---
     if act_n:
         p("<div class='tabpanel' data-tab='tab-adj'>")
-        p("<div class='acct' style='border:2px solid #d29922;background:#3a2d0a;margin-bottom:12px'>"
-          "<h2 style='color:#f2cc60'>&#9888; ADJUSTMENT MODE &mdash; "
+        p("<div class='acct' style='border:2px solid #1f6feb;background:#1f6feb22;margin-bottom:12px'>"
+          "<h2 style='color:#58a6ff'>&#9888; ADJUSTMENT MODE &mdash; "
           f"{act_n} change(s) since your last ONE export{exp_t}</h2>"
           "<div class='muted' style='margin-bottom:8px'>Replicate these in ONE "
           "(re-export &rarr; Check now) and edit the same-named OptionStrat combos."
@@ -861,28 +1185,37 @@ def render_html() -> str:
 
         p("<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;background:#161b22;padding:6px 10px;border-radius:6px;border:1px solid #30363d;'>"
           "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap;'>"
-          "<span style='font-weight:600;font-size:12px;color:#f2cc60;'>Group / Sort by:</span>"
+          "<span style='font-weight:600;font-size:12px;color:#58a6ff;'>Group / Sort by:</span>"
           "<select id='adj-sort-by' onchange='window.renderAdjustments()' style='background:#0d1117;color:#e6edf3;border:1px solid #30363d;padding:3px 8px;border-radius:4px;font-size:12px;outline:none;'>"
+          "<option value='time' selected>⏱ Execution time (newest first)</option>"
+          "<option value='trade_id'>🆔 ONE Trade ID (Trade #74, #100, #115...)</option>"
           "<option value='category'>📁 Category (Rolled &rarr; New &rarr; Closed &rarr; Adjusted)</option>"
           "<option value='ticker'>🏷️ Ticker / Symbol (ADBE, RUT, SPX, UAL...)</option>"
-          "<option value='trade_id'>🆔 ONE Trade ID (Trade #74, #100, #115...)</option>"
           "<option value='account'>🏦 Account ID (F244..., U232..., U455...)</option>"
           "</select>"
           "<div style='display:flex;gap:4px;margin-left:4px;'>"
+          "<button onclick='window.setAdjSort(\"time\")' style='background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:2px 8px;border-radius:4px;font-size:11px;cursor:pointer;'>Execution time</button>"
+          "<button onclick='window.setAdjSort(\"trade_id\")' style='background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:2px 8px;border-radius:4px;font-size:11px;cursor:pointer;'>ONE Trade ID</button>"
           "<button onclick='window.setAdjSort(\"category\")' style='background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:2px 8px;border-radius:4px;font-size:11px;cursor:pointer;'>Category</button>"
           "<button onclick='window.setAdjSort(\"ticker\")' style='background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:2px 8px;border-radius:4px;font-size:11px;cursor:pointer;'>Ticker</button>"
-          "<button onclick='window.setAdjSort(\"trade_id\")' style='background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:2px 8px;border-radius:4px;font-size:11px;cursor:pointer;'>ONE Trade ID</button>"
           "<button onclick='window.setAdjSort(\"account\")' style='background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:2px 8px;border-radius:4px;font-size:11px;cursor:pointer;'>Account</button>"
           "</div>"
           "</div>"
-          "<div style='display:flex;align-items:center;gap:6px;'>"
-          "<input type='text' id='adj-filter-search' oninput='window.renderAdjustments()' placeholder='🔍 Filter (e.g. SPX, #117, U455...)' style='background:#0d1117;color:#e6edf3;border:1px solid #30363d;padding:3px 8px;border-radius:4px;font-size:12px;width:180px;outline:none;' />"
+          "<div style='display:flex;align-items:center;gap:6px;flex-wrap:wrap;'>"
+          "<select id='adj-filter-ticker' onchange='window.renderAdjustments()' class='adj-filter'><option value=''>All tickers</option></select>"
+          "<select id='adj-filter-strike' onchange='window.renderAdjustments()' class='adj-filter'><option value=''>All strikes</option></select>"
+          "<select id='adj-filter-trade' onchange='window.renderAdjustments()' class='adj-filter'><option value=''>All ONE trade IDs</option></select>"
+          "<select id='adj-filter-account-type' onchange='window.renderAdjustments()' class='adj-filter'><option value=''>All account types</option></select>"
+          "<select id='adj-filter-account' onchange='window.renderAdjustments()' class='adj-filter'><option value=''>All accounts</option></select>"
+          "<select id='adj-filter-status' onchange='window.renderAdjustments()' class='adj-filter'><option value=''>All statuses</option></select>"
+          "<input type='text' id='adj-filter-search' oninput='window.renderAdjustments()' placeholder='🔍 Search; space = AND' class='adj-filter' style='width:175px;' />"
+          "<button onclick='window.clearAdjFilters()' style='background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:3px 8px;border-radius:4px;font-size:11px;cursor:pointer;'>Clear filters</button>"
           "<button onclick='window.copyAdjustmentsText()' style='background:#238636;color:#ffffff;border:none;padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;cursor:pointer;' title='Copy checklist to clipboard'>📋 Copy</button>"
           "</div>"
           "</div>")
 
         p("<div id='adj-content'></div></div></div>")
-        p(f"<script>window.ADJ_DATA = {json.dumps(adj_list)};</script>")
+        p(f"<script>window.ADJ_DATA = {json.dumps(adj_list)}; window.TRADE_ADJ_DATA = {json.dumps(trade_adj_list)};</script>")
 
     # --- TABPANEL 3: TODAY'S IBKR FILLS ---
     if fills:
@@ -1049,6 +1382,10 @@ def render_oneos_html() -> str:
     r = st.get("oneos")
     os_file = os.path.basename(st.get("oneos_file") or "")
     os_age = _age(st.get("oneos_mtime"))
+    os_stale = bool(
+        st.get("oneos_mtime")
+        and time.time() - st["oneos_mtime"] > 3600
+    )
 
     parts = [_page_head("ONE ↔ OptionStrat · TWS Matcher", refresh_secs=60)]
     p = parts.append
@@ -1077,6 +1414,10 @@ def render_oneos_html() -> str:
 
     p(f"<div class='sub'>OptionStrat report: {html.escape(os_file)} &middot; {os_age} "
       f"&middot; price tol ${r['price_tol']:.2f}/sh</div>")
+    if os_stale:
+        p("<div class='acct' style='border:2px solid #d29922;background:#2d250d'>"
+          "<b class='warn'>OptionStrat export is stale.</b> Download a fresh "
+          "<i>all active</i> report before relying on this comparison.</div>")
     tags = [("#cf222e", f"DIFFS {len(diffs)}"),
             ("#8250df", f"only in ONE {len(one_only)}"),
             ("#0969da", f"only in OptionStrat {len(os_only)}"),
@@ -1190,11 +1531,13 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 st = dict(_state)
                 result = st.get("result") or {}
-            ibkr_snap = {"legs": [], "fills_today": result.get("fills_today", [])}
-            one_snap = {"positions": []}
-            subject, html_body = email_report.generate_report_html(ibkr_snap, one_snap, cfg)
-            interactive_html = render_html()
-            success, msg = email_report.send_email(subject, html_body, cfg, attachment_html=interactive_html)
+            ibkr_snap = st.get("ibkr_snap") or {
+                "legs": [], "fills_today": result.get("fills_today", [])}
+            one_snap = st.get("one_snap") or {"positions": []}
+            subject, html_body = email_report.generate_report_html(
+                ibkr_snap, one_snap, cfg, reconciliation_result=result)
+            success, msg = email_report.send_email(
+                subject, html_body, cfg, attachment_html=html_body)
             _set(status=msg)
             self.send_response(303)
             self.send_header("Location", "/")
