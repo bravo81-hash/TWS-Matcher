@@ -255,10 +255,42 @@ def _is_trade_header(row):
     return "TradeName" in row and "TradeId" in row and "Symbol" not in row
 
 
-def read_summary_report(path: str):
+def parse_trade_row(row: list[str], cols: dict | None) -> dict:
+    """A TRADE summary row -> its header fields (name, status, risk, ids)."""
+    cols = cols or {}
+
+    def g(name, default=""):
+        i = cols.get(name)
+        return row[i].strip() if (i is not None and i < len(row)) else default
+
+    # ONE labels this column per the report's Margin dropdown; under the
+    # "Max Absolute Risk" setting it is the trade's worst-case exposure.
+    margin_col = next((c for c in ("Margin", "MaxAbsRisk", "Max Abs Risk")
+                       if c in cols), None)
+    return {
+        "account": normalize_account_name(g("Account")),
+        "trade_id": g("TradeId"),
+        "trade_name": g("TradeName"),
+        "status": g("Status"),
+        "underlying": g("Underlying"),
+        "expiration": _parse_dmy(g("Expiration")),
+        "open_date": g("OpenDate"),
+        "margin": _f(row[cols[margin_col]]) if margin_col else None,
+        "has_margin_column": margin_col is not None,
+    }
+
+
+def read_summary_report(path: str, collect_trades: list | None = None):
+    """Parse a ONE report into leg dicts.
+
+    Pass a list as ``collect_trades`` to also receive the TRADE-level summary
+    rows; they carry the per-trade risk figure that find_ghost_trades() needs
+    and which the leg rows do not expose.
+    """
     legs = []
     current_name = None          # TradeName from the most recent TRADE data row
     leg_cols = None              # name->index map from the leg header row
+    trade_cols = None            # name->index map from the trade header row
     trade_name_idx = 5           # fallback (old layout); set from trade header
     detail_mode = False
     with open(path, newline="", encoding="utf-8-sig") as fh:
@@ -272,13 +304,15 @@ def read_summary_report(path: str):
                 detail_mode = "Price" in leg_cols and "AvgOpenPrice" not in leg_cols
                 continue
             if _is_trade_header(row):
-                trade_name_idx = {name: i for i, name in enumerate(row)
-                                  if name}.get("TradeName", trade_name_idx)
+                trade_cols = {name: i for i, name in enumerate(row) if name}
+                trade_name_idx = trade_cols.get("TradeName", trade_name_idx)
                 continue
             kind = _row_kind(row)
             if kind == "trade":
                 current_name = (row[trade_name_idx].strip()
                                 if len(row) > trade_name_idx else "") or None
+                if collect_trades is not None:
+                    collect_trades.append(parse_trade_row(row, trade_cols))
             elif kind == "leg":
                 leg = parse_leg_row(row, leg_cols)
                 if leg:
@@ -363,6 +397,26 @@ def print_table(positions: list[dict]) -> None:
     print("=" * 74 + "\n")
 
 
+def print_ghost_trades(ghosts: list[dict]) -> None:
+    if not ghosts:
+        return
+    print("!" * 74)
+    print(f"GHOST TRADES  ({len(ghosts)})  --  open in ONE's report, but ONE holds")
+    print("no position for them: not selectable in Analysis, cannot be adjusted.")
+    print("!" * 74)
+    for g in ghosts:
+        print(f"\n  [{g['account']}]  #{g['trade_id']}  {g['trade_name']}"
+              f"   ({g['underlying']}, opened {g['open_date']})")
+        print(f"    flagged because {', and '.join(g['reasons'])}.")
+        for l in g["legs"]:
+            lbl = (f'{l["tradingClass"]} {_pretty_expiry(l["expiry"])} '
+                   f'{l["strike"]:g}{l["right"]}')
+            print(f'      {lbl:<30}{l["qty"]:>7.0f} @ {l["open_price"]:.2f}')
+        print("    FIX: rebuild it as a new trade in ONE's Analysis window, "
+              "then delete this one.")
+    print()
+
+
 def find_default_csv(search_dirs=None) -> str:
     """Newest supported ONE report in Downloads/Documents, else sample."""
     dirs = search_dirs or DEFAULT_EXPORT_DIRS
@@ -398,10 +452,65 @@ def extract_one_trades(legs: list[dict]) -> list[dict]:
     return trades
 
 
+def find_ghost_trades(trade_rows: list[dict], legs: list[dict]) -> list[dict]:
+    """ONE trades that report as Open but were never made into a position.
+
+    A Flex import writes transactions first and materialises a position in the
+    wizard's "link trades into positions" step.  If that step is left
+    incomplete, the trade still shows in the Reports/Trade Log views -- so its
+    legs land in this reader and reconcile fine -- while ONE holds no position
+    for it.  Such a trade cannot be selected in the Analysis window, so its legs
+    can never be adjusted, and ONE models no risk for it.
+
+    The tell is a zero risk figure on a trade that still holds open legs: no
+    real position has zero worst-case exposure.  A missing trade name is
+    corroborating (the wizard names a trade when it creates the position) but
+    is too weak on its own -- a hand-built trade may simply be unnamed.
+    """
+    open_legs = defaultdict(list)
+    for lg in legs:
+        if lg.get("is_open"):
+            open_legs[(lg["account"], lg.get("trade_id"))].append(lg)
+
+    ghosts = []
+    for t in trade_rows:
+        # Without the risk column there is nothing to test; stay silent rather
+        # than flag every trade in the export.
+        if not t.get("has_margin_column") or t.get("margin") is None:
+            continue
+        if str(t.get("status", "")).lower() != "open":
+            continue
+        tlegs = open_legs.get((t["account"], t["trade_id"]), [])
+        if not tlegs or abs(t["margin"]) > 1e-9:
+            continue
+        reasons = ["ONE models no risk for it (Max Abs Risk = 0)"]
+        if not t["trade_name"]:
+            reasons.append("it has no trade name")
+        ghosts.append({
+            "account": t["account"],
+            "trade_id": t["trade_id"],
+            "trade_name": t["trade_name"] or f"(unnamed trade #{t['trade_id']})",
+            "underlying": t["underlying"],
+            "expiration": t["expiration"],
+            "open_date": t["open_date"],
+            "margin": t["margin"],
+            "leg_count": len(tlegs),
+            "reasons": reasons,
+            "legs": [{
+                "tradingClass": l["tradingClass"], "expiry": match_expiry(l),
+                "strike": l["strike"], "right": l["right"],
+                "qty": l["qty"], "open_price": l["open_price"],
+            } for l in sorted(tlegs, key=lambda x: (x["strike"], x["right"]))],
+        })
+    ghosts.sort(key=lambda g: (g["account"], g["trade_id"]))
+    return ghosts
+
+
 def build_one_snapshot(path: str) -> dict:
     """Read a ONE Summary Report CSV -> canonical ONE snapshot dict.
     Reused by the dashboard daemon (no console output / file write)."""
-    legs = read_summary_report(path)
+    trade_rows = []
+    legs = read_summary_report(path, collect_trades=trade_rows)
     positions = net_positions(legs)
     trades = extract_one_trades(legs)
     return {
@@ -412,6 +521,7 @@ def build_one_snapshot(path: str) -> dict:
         "accounts": sorted({p["account"] for p in positions}),
         "positions": positions,
         "trades": trades,
+        "ghost_trades": find_ghost_trades(trade_rows, legs),
         "raw_legs": legs,
     }
 
@@ -419,25 +529,16 @@ def build_one_snapshot(path: str) -> dict:
 def main() -> None:
     path = sys.argv[1] if len(sys.argv) > 1 else find_default_csv()
     print(f"Reading ONE Summary Report: {path}")
-    legs = read_summary_report(path)
+    snapshot = build_one_snapshot(path)
+    legs, positions = snapshot["raw_legs"], snapshot["positions"]
+    trades, ghosts = snapshot["trades"], snapshot["ghost_trades"]
     open_legs = [l for l in legs if l["is_open"]]
     print(f"Parsed {len(legs)} leg rows  ({len(open_legs)} open, "
           f"{len(legs) - len(open_legs)} closed)")
 
-    positions = net_positions(legs)
-    trades = extract_one_trades(legs)
     print_table(positions)
+    print_ghost_trades(ghosts)
 
-    snapshot = {
-        "captured_at": datetime.now(timezone.utc).isoformat(),
-        "source": "ONE/SummaryReport",
-        "source_file": path,
-        "source_mtime": os.path.getmtime(path) if os.path.exists(path) else None,
-        "accounts": sorted({p["account"] for p in positions}),
-        "positions": positions,
-        "trades": trades,
-        "raw_legs": legs,
-    }
     with open(OUTPUT_JSON, "w") as fh:
         json.dump(snapshot, fh, indent=2, default=str)
     print(f"Wrote {OUTPUT_JSON}  ({len(positions)} net positions across "

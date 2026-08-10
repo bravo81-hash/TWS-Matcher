@@ -23,6 +23,28 @@ def option(account="A14+HV7", *, qty=1.0, price=10.0):
     }
 
 
+def one_leg(account="SMSF", **over):
+    """A raw ONE report leg, as read_summary_report() emits it."""
+    return {
+        "account": account, "trade_id": "1", "underlying": "SPX",
+        "tradingClass": "SPXW", "expiry": "20260808", "expiry_listed": "20260807",
+        "strike": 7400.0, "right": "P", "multiplier": 100.0, "qty": -1.0,
+        "open_price": 10.0, "is_open": True, "is_expired": False,
+        **over,
+    }
+
+
+def trade_row(account="SMSF", *, trade_id="1", name="A Trade",
+              margin=1000.0, status="Open"):
+    """A TRADE summary row, as parse_trade_row() emits it."""
+    return {
+        "account": account, "trade_id": trade_id, "trade_name": name,
+        "status": status, "underlying": "SPX", "expiration": "20260807",
+        "open_date": "8/08/2026 6:11 AM", "margin": margin,
+        "has_margin_column": True,
+    }
+
+
 def config():
     return {
         "account_map": {"A14+HV7": "U1"},
@@ -174,6 +196,57 @@ class ReconciliationTests(unittest.TestCase):
             sorted(f["status"] for f in result["accounts"]["U1"]),
             ["IBKR_ONLY", "ONE_ONLY"],
         )
+
+    def test_ghost_trade_is_detected_from_zero_risk(self):
+        legs = [{**one_leg(), "trade_id": "154"}]
+        trades = [trade_row(trade_id="154", name="", margin=0.0)]
+        [ghost] = one_reader.find_ghost_trades(trades, legs)
+        self.assertEqual(ghost["trade_id"], "154")
+        self.assertEqual(ghost["leg_count"], 1)
+        self.assertIn("no trade name", " ".join(ghost["reasons"]))
+
+    def test_healthy_and_legless_trades_are_not_ghosts(self):
+        legs = [{**one_leg(), "trade_id": "153"}]
+        self.assertEqual(one_reader.find_ghost_trades([
+            trade_row(trade_id="153", margin=11535.36),      # real risk
+            trade_row(trade_id="900", margin=0.0),           # zero risk, no legs
+            trade_row(trade_id="901", margin=0.0, status="Closed"),
+        ], legs), [])
+
+    def test_unnamed_trade_with_real_risk_is_not_a_ghost(self):
+        """A blank name alone is too weak -- a hand-built trade may be unnamed."""
+        legs = [{**one_leg(), "trade_id": "153"}]
+        self.assertEqual(one_reader.find_ghost_trades(
+            [trade_row(trade_id="153", name="", margin=8953.5)], legs), [])
+
+    def test_missing_risk_column_flags_nothing(self):
+        legs = [{**one_leg(), "trade_id": "153"}]
+        row = trade_row(trade_id="153", margin=0.0)
+        row.update(margin=None, has_margin_column=False)
+        self.assertEqual(one_reader.find_ghost_trades([row], legs), [])
+
+    def test_ghost_trade_breaks_the_all_clear_even_when_legs_reconcile(self):
+        """A ghost's legs are in the report, so they match -- the trade is still
+        unmanageable in ONE and must not be reported as all-clear."""
+        result = reconcile.reconcile_snapshots(
+            {"captured_at": "now", "fills_today": [],
+             "legs": [option(account="U1", qty=-1.0)]},
+            {"source_file": "report.csv",
+             "positions": [{**option(qty=-1.0), "avg_price": 10.0}],
+             "ghost_trades": [{
+                 "account": "A14+HV7", "trade_id": "154", "trade_name": "x",
+                 "underlying": "SPX", "expiration": "20260807",
+                 "open_date": "8/08/2026", "margin": 0.0, "leg_count": 1,
+                 "reasons": ["ONE models no risk for it"],
+                 "legs": [{"tradingClass": "SPXW", "expiry": "20260807",
+                           "strike": 7400.0, "right": "P", "qty": -1.0,
+                           "open_price": 10.0}],
+             }]},
+            config(),
+        )
+        self.assertEqual(result["accounts"]["U1"][0]["status"], "MATCH")
+        [ghost] = result["ghost_trades"]
+        self.assertEqual(ghost["ibkr_account"], "U1")
 
     def test_monthly_expiry_offset_does_not_mark_live_trade_closed(self):
         current = {

@@ -825,10 +825,12 @@ def render_html() -> str:
         st.get("one_mtime")
         and time.time() - st["one_mtime"] > 3600
     )
+    ghosts = (result or {}).get("ghost_trades", []) or []
     prob_n = (
         sum(1 for finds in result["accounts"].values() for f in finds
             if _alerting(f))
         + sum(active_unmapped.values())
+        + len(ghosts)
         if result else 0
     )
     if not result:
@@ -864,6 +866,39 @@ def render_html() -> str:
           "BUT THE ONE EXPORT IS STALE</h2>"
           "<div class='muted'>Export a fresh open-position report from ONE and "
           "click Check now before relying on this assurance.</div></div>")
+
+    if ghosts:
+        p("<div class='acct' style='border:2px solid #d29922;background:#2d250d;"
+          "margin-bottom:14px'>"
+          f"<h2 style='color:#f2cc60;margin:0 0 4px'>👻 {len(ghosts)} GHOST "
+          f"TRADE{'S' if len(ghosts) > 1 else ''} IN ONE</h2>"
+          "<div class='muted'>These report as open in ONE but ONE holds no "
+          "position for them &mdash; they are not selectable in the Analysis "
+          "window, so their legs can never be adjusted, and ONE models no risk "
+          "for them. Their legs still reconcile against IBKR, so the account "
+          "checks below can read clean while the trade is unmanageable.</div>")
+        for g in ghosts:
+            acct = g.get("ibkr_account") or g["account"]
+            legs = " &nbsp;·&nbsp; ".join(
+                f'{l["qty"]:+.0f} {html.escape(str(l["tradingClass"]))} '
+                f'{one_reader._pretty_expiry(l["expiry"])} '
+                f'{l["strike"]:g}{l["right"]}'
+                f' @ {l["open_price"]:.2f}'
+                for l in g["legs"])
+            p(f"<div style='margin-top:10px'><b>{html.escape(str(acct))}</b> "
+              f"&mdash; ONE trade <b>#{html.escape(str(g['trade_id']))}</b> "
+              f"{html.escape(str(g['trade_name']))} "
+              f"<span class='muted'>({html.escape(str(g['underlying']))}, "
+              f"opened {html.escape(str(g['open_date']))})</span>"
+              f"<div class='muted' style='margin:2px 0'>Flagged because "
+              f"{html.escape(', and '.join(g['reasons']))}.</div>"
+              f"<div style='font-family:monospace;font-size:12px'>{legs}</div>"
+              f"<div class='muted' style='margin-top:2px'>Fix: rebuild it as a "
+              f"new trade in ONE&rsquo;s Analysis window "
+              f"(<i>Start New Trade</i>), then delete #"
+              f"{html.escape(str(g['trade_id']))} in the Trade Log so its legs "
+              f"are not counted twice.</div></div>")
+        p("</div>")
 
     if st.get("error"):
         p(f"<div class='acct' style='border-color:#cf222e'><b class='warn'>"

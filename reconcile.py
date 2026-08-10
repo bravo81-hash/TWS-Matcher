@@ -38,6 +38,7 @@ import os
 from collections import defaultdict
 from datetime import datetime, timezone
 
+import one_reader
 from one_reader import normalize_account_name
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -758,10 +759,19 @@ def reconcile_snapshots(ibkr_snapshot, one_snapshot, cfg):
         account_map=account_map
     )
 
+    # Ghost trades reconcile fine leg-by-leg (their legs ARE in the report), so
+    # they never surface as a finding -- carry them through explicitly.
+    ghosts = []
+    for g in one_snapshot.get("ghost_trades", []) or []:
+        ghosts.append({**g,
+                       "ibkr_account": resolve_one_account(g["account"],
+                                                           account_map)})
+
     return {
         "reconciled_at": datetime.now(timezone.utc).isoformat(),
         "ibkr_source": ibkr_snapshot.get("captured_at"),
         "one_source": one_snapshot.get("source_file"),
+        "ghost_trades": ghosts,
         "one_source_mtime": one_source_mtime,
         "tolerances": tol,
         "accounts": by_account,
@@ -784,6 +794,7 @@ def main():
     _, unmapped = net_one(one["positions"], cfg["account_map"])
     print_report(result["accounts"], unmapped, set(result["ignore_one_accounts"]),
                  accounts)
+    one_reader.print_ghost_trades(result.get("ghost_trades", []))
 
     with open(OUTPUT_JSON, "w") as fh:
         json.dump(result, fh, indent=2, default=str)

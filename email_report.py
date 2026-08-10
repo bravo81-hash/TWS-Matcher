@@ -127,7 +127,8 @@ def generate_report_html(
         for name, count in result.get("unmapped_one_groups", {}).items()
         if one_reader.normalize_account_name(name) not in ignored
     }
-    issue_count = len(actionable) + sum(unmapped.values())
+    ghosts = result.get("ghost_trades", []) or []
+    issue_count = len(actionable) + sum(unmapped.values()) + len(ghosts)
     one_mtime = result.get("one_source_mtime") or one_snap.get("source_mtime")
     if not one_mtime and one_path and os.path.exists(one_path):
         one_mtime = os.path.getmtime(one_path)
@@ -245,6 +246,25 @@ HTML file is opened in a browser.</div>
         parts.append(
             "<div class='warnbox'><b>Unmapped ONE account group(s):</b> "
             f"{group_text}. The comparison is not trustworthy until mapped.</div>")
+
+    for ghost in ghosts:
+        legs_text = " · ".join(
+            f'{leg["qty"]:+.0f} {leg["tradingClass"]} '
+            f'{one_reader._pretty_expiry(leg["expiry"])} '
+            f'{leg["strike"]:g}{leg["right"]} @ {leg["open_price"]:.2f}'
+            for leg in ghost["legs"])
+        parts.append(
+            "<div class='warnbox'><b>Ghost trade in ONE &mdash; "
+            f"{_escape(str(ghost.get('ibkr_account') or ghost['account']))} "
+            f"#{_escape(str(ghost['trade_id']))} "
+            f"{_escape(str(ghost['trade_name']))}.</b> "
+            "It reports as open but ONE holds no position for it, so it cannot "
+            "be selected in the Analysis window and its legs can never be "
+            f"adjusted. Flagged because {_escape(', and '.join(ghost['reasons']))}. "
+            f"<br><span style='font-family:monospace'>{_escape(legs_text)}</span>"
+            "<br>Fix: rebuild it as a new trade in ONE, then delete "
+            f"#{_escape(str(ghost['trade_id']))} so its legs are not counted "
+            "twice.</div>")
 
     parts.append("<h2>IBKR ↔ ONE reconciliation</h2>")
     for account, findings in sorted(result.get("accounts", {}).items()):
