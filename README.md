@@ -40,6 +40,13 @@ Report** sends a frozen, self-contained reconciliation in the email body and as
 an attached HTML file; either can be opened on another computer without TWS,
 ONE, or access to the local dashboard.
 
+The **ONE Flex Import** tab builds one ONE-compatible file per IBKR account from
+actual TWS executions. Executions are persisted and deduplicated by broker
+execution ID across reconnects. The dashboard exposes a normal import file only
+when observed option-position changes are fully explained by captured fills; an
+unexplained change is marked `POSSIBLY_INCOMPLETE` and the prior normal file is
+quarantined with a `.stale` suffix.
+
 ONE report-order prefixes such as `1.A14+HV7` are normalized automatically.
 Broker-only stock and ETF holdings are shown as expected information because
 ONE models the option strategies, while option identity/quantity differences

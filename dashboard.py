@@ -132,6 +132,8 @@ def worker():
 def run_cycle(ib: IB, cfg: dict):
     _set(status="refreshing")
     ibkr_snap = eng.build_snapshot(ib)
+    ibkr_snap, flex_completeness = flex_export.update_execution_journal(
+        ibkr_snap)
 
     one_path = one_reader.find_default_csv(cfg.get("one_export_dirs"))
     one_mtime = os.path.getmtime(one_path) if os.path.exists(one_path) else None
@@ -145,15 +147,10 @@ def run_cycle(ib: IB, cfg: dict):
     flex_by_acct, flex_skipped = flex_export.generate(
         ibkr_snap, cfg.get("flex_timezone"))
 
-    # Auto-save ONE Flex import CSV files into flex_export/ folder inside TWS Matcher
-    out_dir = os.path.join(HERE, "flex_export")
-    os.makedirs(out_dir, exist_ok=True)
-    for acct_id, rows in flex_by_acct.items():
-        csv_path = os.path.join(out_dir, f"ONEImport_{acct_id}.csv")
-        with open(csv_path, "w", newline="", encoding="utf-8") as fh:
-            w = csv.writer(fh, quoting=csv.QUOTE_ALL)
-            w.writerow(flex_export.HEADER)
-            w.writerows(rows)
+    # A normal import exists only when every observed option-position change
+    # is explained by persisted executions. Incomplete files are quarantined.
+    flex_paths = flex_export.save_account_files(
+        flex_by_acct, flex_completeness)
 
     # classify broker activity since the last ONE export (rolled/opened/closed/...)
     one_raw_legs = one_reader.read_summary_report(one_path) if (one_path and os.path.exists(one_path)) else []
@@ -188,6 +185,8 @@ def run_cycle(ib: IB, cfg: dict):
          os_strategies=os_strategies,
          flex={a: rows for a, rows in flex_by_acct.items()},
          flex_skipped=flex_skipped,
+         flex_completeness=flex_completeness,
+         flex_paths=flex_paths,
          activity=activity,
          account_codes=cfg.get("account_codes") or {},
          naming=naming_rows,
@@ -1079,6 +1078,13 @@ def render_html() -> str:
     fills = result.get("fills_today", [])
     os_strats = st.get("os_strategies") or []
     flex = st.get("flex") or {}
+    flex_completeness = st.get("flex_completeness") or {}
+    flex_problem_accounts = {
+        account for account, check in flex_completeness.items()
+        if account != "UNASSIGNED"
+        and check.get("status") != flex_export.COMPLETE
+    }
+    flex_accounts = sorted(set(flex) | flex_problem_accounts)
     accts_count = len(result["accounts"])
 
     p("<div data-tabgroup='main-dash' style='margin-top:10px;'>")
@@ -1090,8 +1096,8 @@ def render_html() -> str:
         p(f"<a href='#' class='tabbtn' data-tab='tab-fills'>📋 Today's IBKR Fills ({len(fills)})</a>")
     if os_strats:
         p(f"<a href='#' class='tabbtn' data-tab='tab-optionstrat'>📱 OptionStrat Mirror ({len(os_strats)})</a>")
-    if flex:
-        p(f"<a href='#' class='tabbtn' data-tab='tab-flex'>📥 ONE Flex Import ({len(flex)})</a>")
+    if flex_accounts:
+        p(f"<a href='#' class='tabbtn' data-tab='tab-flex'>📥 ONE Flex Import ({len(flex_accounts)})</a>")
     p("</div>")
 
     # --- TABPANEL 1: ACCOUNT RECONCILIATIONS ---
@@ -1329,23 +1335,58 @@ def render_html() -> str:
         p("</div></div></div>")
 
     # --- TABPANEL 4: ONE FLEX IMPORT ---
-    if flex:
+    if flex_accounts:
         p("<div class='tabpanel' data-tab='tab-flex'>")
         skipped = st.get("flex_skipped", 0)
         out_folder = os.path.join(HERE, "flex_export")
+        incomplete = sorted(flex_problem_accounts)
         p("<div class='acct'><h2>ONE Flex Import "
           f"<span class='muted'>today's fills &middot; {skipped} non-option skipped</span></h2>")
+        if incomplete:
+            p("<div style='border:2px solid #d29922;background:#2d250d;padding:7px 9px;"
+              "border-radius:5px;margin-bottom:8px;color:#f2cc60'><b>IMPORT BLOCKED:</b> "
+              "TWS positions moved without matching captured executions. Review the "
+              "listed discrepancies and click Check now; normal import files remain "
+              "quarantined until execution history catches up.</div>")
+        else:
+            p("<div style='border:1px solid #238636;background:#0d2818;padding:6px 9px;"
+              "border-radius:5px;margin-bottom:8px;color:#3fb950'><b>IMPORT COMPLETE:</b> "
+              "Every observed option-position change is explained by persisted, "
+              "deduplicated TWS executions.</div>")
         p(f"<div class='sub' style='margin-bottom:8px;color:#3fb950;font-size:12.5px;'>"
           f"📁 <b>Saved automatically to local folder:</b> <code class='mono' style='background:#21262d;padding:2px 6px;border-radius:4px;color:#e6edf3;'>{html.escape(out_folder)}</code>"
           "</div>")
-        p("<div class='table-wrap'><table><tr><th class='l'>account</th><th>fill rows</th>"
+        p("<div class='table-wrap'><table><tr><th class='l'>account</th>"
+          "<th class='l'>status</th><th>fill rows</th>"
           "<th class='l'>local file path</th><th class='l'>download link</th></tr>")
-        for acct in sorted(flex):
-            n = len(flex[acct])
-            f_path = os.path.join(out_folder, f"ONEImport_{acct}.csv")
-            p(f"<tr><td class='l'>{html.escape(acct)}</td><td class='mono'>{n}</td>"
+        for acct in flex_accounts:
+            n = len(flex.get(acct) or [])
+            check = flex_completeness.get(str(acct)) or {}
+            complete = check.get("status") == flex_export.COMPLETE
+            status = (flex_export.COMPLETE if complete
+                      else flex_export.POSSIBLY_INCOMPLETE)
+            color = "#238636" if complete else "#d29922"
+            f_path = (st.get("flex_paths") or {}).get(acct, "")
+            download = (
+                f"<a href='/flex/{html.escape(acct)}.csv' class='btn' "
+                "style='font-size:11px;padding:2px 8px;text-decoration:none;'>"
+                f"Download ONEImport_{html.escape(acct)}.csv</a>"
+                if complete else
+                "<span class='warn'>blocked pending complete fills</span>"
+            )
+            p(f"<tr><td class='l'>{html.escape(acct)}</td>"
+              f"<td class='l'><span class='tag' style='background:{color}'>{status}</span></td>"
+              f"<td class='mono'>{n}</td>"
               f"<td class='l mono muted' style='font-size:11.5px;'>{html.escape(f_path)}</td>"
-              f"<td class='l'><a href='/flex/{html.escape(acct)}.csv' class='btn' style='font-size:11px;padding:2px 8px;text-decoration:none;'>⬇️ ONEImport_{html.escape(acct)}.csv</a></td></tr>")
+              f"<td class='l'>{download}</td></tr>")
+            for issue in check.get("discrepancies") or []:
+                if "expected_qty" not in issue:
+                    continue
+                p("<tr><td></td><td colspan='4' class='l warn mono'>"
+                  f"{html.escape(issue['instrument'])}: position "
+                  f"{issue['position_qty']:+g}, executions imply "
+                  f"{issue['expected_qty']:+g} (unexplained "
+                  f"{issue['unexplained_qty']:+g})</td></tr>")
         p("</table></div><div class='muted' style='margin-top:6px'>"
           "Point ONE's import wizard directly to these files, then run ONE's link-trades step.</div></div></div>")
 
@@ -1540,7 +1581,10 @@ def flex_csv_bytes(account: str) -> bytes | None:
     """Build the IBKR-Flex CSV for one account from current state, in memory."""
     with _lock:
         rows = (_state.get("flex") or {}).get(account)
+        check = (_state.get("flex_completeness") or {}).get(account) or {}
     if rows is None:
+        return None
+    if check.get("status") != flex_export.COMPLETE:
         return None
     buf = io.StringIO()
     w = csv.writer(buf, quoting=csv.QUOTE_ALL)

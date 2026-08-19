@@ -1,9 +1,12 @@
 import unittest
 import time
-from datetime import date
+import os
+import tempfile
+from datetime import date, datetime, timezone
 
 import email_report
 import dashboard
+import flex_export
 import one_reader
 import recon_one_os
 import reconcile
@@ -418,6 +421,86 @@ class DashboardAdjustmentTests(unittest.TestCase):
         self.assertIn("border:2px solid #1f6feb", page)
         self.assertIn("background:#1f6feb22", page)
         self.assertNotIn("background:#3a2d0a", page)
+
+
+class FlexImportCompletenessTests(unittest.TestCase):
+    @staticmethod
+    def fill(*, exec_id="E1", qty=1.0):
+        return {
+            "account": "U1", "secType": "OPT", "underlying": "SPX",
+            "tradingClass": "SPXW", "expiry": "20260821",
+            "strike": 7400.0, "right": "P", "shares": abs(qty),
+            "side": "BOT" if qty > 0 else "SLD", "price": 10.0,
+            "time": "2026-08-20T15:00:00+00:00", "execId": exec_id,
+        }
+
+    @staticmethod
+    def snapshot(qty, fills):
+        legs = [] if qty == 0 else [{
+            **option(account="U1", qty=qty), "expiry": "20260821",
+        }]
+        return {
+            "captured_at": "2026-08-20T16:00:00+00:00",
+            "managed_accounts": ["U1"], "legs": legs,
+            "fills_today": fills,
+        }
+
+    def test_journal_persists_deduplicates_and_detects_missing_fill(self):
+        now = datetime(2026, 8, 20, 16, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "journal.json")
+            _, checks = flex_export.update_execution_journal(
+                self.snapshot(0, []), path, now)
+            self.assertEqual(checks["U1"]["status"], flex_export.COMPLETE)
+
+            fill = self.fill()
+            merged, checks = flex_export.update_execution_journal(
+                self.snapshot(1, [fill]), path, now)
+            self.assertEqual(checks["U1"]["status"], flex_export.COMPLETE)
+            self.assertEqual(len(merged["fills_today"]), 1)
+
+            merged, _ = flex_export.update_execution_journal(
+                self.snapshot(1, [fill]), path, now)
+            self.assertEqual(len(merged["fills_today"]), 1)
+
+            _, checks = flex_export.update_execution_journal(
+                self.snapshot(2, [fill]), path, now)
+            self.assertEqual(
+                checks["U1"]["status"], flex_export.POSSIBLY_INCOMPLETE)
+            self.assertEqual(
+                checks["U1"]["discrepancies"][0]["unexplained_qty"], 1)
+
+    def test_incomplete_import_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [["20260821,010000", "BUY", "OPT", "symbol", "1",
+                     "10", "", "SPX", "-1000"]]
+            normal = os.path.join(tmp, "ONEImport_U1.csv")
+            flex_export._write_csv(normal, rows)
+            paths = flex_export.save_account_files(
+                {},
+                {"U1": {"status": flex_export.POSSIBLY_INCOMPLETE}},
+                tmp,
+            )
+            self.assertFalse(os.path.exists(normal))
+            self.assertTrue(os.path.exists(normal + ".stale"))
+            self.assertIn(flex_export.POSSIBLY_INCOMPLETE, paths["U1"])
+
+    def test_non_option_fills_remain_visible_but_are_not_exported(self):
+        now = datetime(2026, 8, 20, 16, tzinfo=timezone.utc)
+        stock_fill = {
+            "account": "U1", "secType": "STK", "underlying": "SPY",
+            "tradingClass": "SPY", "shares": 1, "side": "BOT",
+            "price": 650, "time": "2026-08-20T15:00:00+00:00",
+            "execId": "STOCK1",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            merged, _ = flex_export.update_execution_journal(
+                self.snapshot(0, [stock_fill]),
+                os.path.join(tmp, "journal.json"), now)
+            self.assertEqual(merged["fills_today"], [stock_fill])
+            rows, skipped = flex_export.generate(merged)
+            self.assertEqual(dict(rows), {})
+            self.assertEqual(skipped, 1)
 
 
 class PortableEmailTests(unittest.TestCase):

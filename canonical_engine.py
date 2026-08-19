@@ -81,11 +81,34 @@ def normalize_position(p: Position) -> dict:
 
 def collect_fills(ib: IB) -> list[dict]:
     out: list[dict] = []
+    fills = []
     try:
-        fills = ib.fills()                            # current-session executions
+        # Refresh executions explicitly on every cycle. The local cache alone
+        # can be incomplete after a reconnect, especially for FA allocations.
+        fills.extend(ib.reqExecutions() or [])
     except Exception:
-        fills = []
+        pass
+    try:
+        fills.extend(ib.fills() or [])
+    except Exception:
+        pass
+
+    # reqExecutions() also updates the local cache, so the lists usually
+    # overlap. Preserve one copy of each broker execution.
+    unique = {}
     for fill in fills:
+        e = fill.execution
+        exec_id = str(getattr(e, "execId", "") or "")
+        key = ((str(getattr(e, "acctNumber", "") or ""), exec_id)
+               if exec_id else repr((
+            getattr(e, "acctNumber", None), getattr(e, "time", None),
+            getattr(e, "orderId", None), getattr(e, "side", None),
+            getattr(e, "shares", None), getattr(e, "price", None),
+            getattr(fill.contract, "conId", None),
+        )))
+        unique[key] = fill
+
+    for fill in unique.values():
         c, e = fill.contract, fill.execution
         cr = getattr(fill, "commissionReport", None)
         commission = _f(getattr(cr, "commission", None)) if cr else None
