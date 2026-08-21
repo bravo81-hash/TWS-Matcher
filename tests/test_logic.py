@@ -1,11 +1,11 @@
-import unittest
-import time
 import os
 import tempfile
+import time
+import unittest
 from datetime import date, datetime, timezone
 
-import email_report
 import dashboard
+import email_report
 import flex_export
 import one_reader
 import recon_one_os
@@ -65,6 +65,47 @@ def config():
             "to_email": "recipient@example.com",
         },
     }
+
+
+class FlexExportHousekeepingTests(unittest.TestCase):
+    def _row(self):
+        return ["Trades", "U1", "SPX", "OPT", "SPXW  260904P07400000"]
+
+    def test_superseded_export_is_deleted_not_left_beside_the_current_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            # a COMPLETE run replaces a previously quarantined file
+            blocked = os.path.join(
+                d, f"ONEImport_U1_{flex_export.POSSIBLY_INCOMPLETE}.csv")
+            open(blocked, "w").close()
+            flex_export.save_account_files(
+                {"U1": [self._row()]},
+                {"U1": {"status": flex_export.COMPLETE}}, out_dir=d)
+            self.assertEqual(sorted(os.listdir(d)), ["ONEImport_U1.csv"])
+
+    def test_incomplete_run_removes_the_stale_complete_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            normal = os.path.join(d, "ONEImport_U1.csv")
+            open(normal, "w").close()
+            flex_export.save_account_files(
+                {"U1": [self._row()]},
+                {"U1": {"status": flex_export.POSSIBLY_INCOMPLETE}}, out_dir=d)
+            self.assertEqual(
+                sorted(os.listdir(d)),
+                [f"ONEImport_U1_{flex_export.POSSIBLY_INCOMPLETE}.csv"])
+
+    def test_existing_dot_stale_leftovers_are_swept(self):
+        """Folders from the rename era heal themselves on the next save."""
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("ONEImport_U1.csv.stale",
+                         "ONEImport_U9_POSSIBLY_INCOMPLETE.csv.stale"):
+                open(os.path.join(d, name), "w").close()
+            keep = os.path.join(d, "notes.txt")
+            open(keep, "w").close()
+            flex_export.save_account_files(
+                {"U1": [self._row()]},
+                {"U1": {"status": flex_export.COMPLETE}}, out_dir=d)
+            self.assertEqual(sorted(os.listdir(d)),
+                             ["ONEImport_U1.csv", "notes.txt"])
 
 
 class ReconciliationTests(unittest.TestCase):
@@ -481,8 +522,12 @@ class FlexImportCompletenessTests(unittest.TestCase):
                 {"U1": {"status": flex_export.POSSIBLY_INCOMPLETE}},
                 tmp,
             )
+            # The superseded file must not remain importable. It is deleted
+            # rather than parked as .stale: it is regenerable from the
+            # execution journal, and a leftover copy beside the current export
+            # is what gets imported into ONE by mistake.
             self.assertFalse(os.path.exists(normal))
-            self.assertTrue(os.path.exists(normal + ".stale"))
+            self.assertFalse(os.path.exists(normal + ".stale"))
             self.assertIn(flex_export.POSSIBLY_INCOMPLETE, paths["U1"])
 
     def test_non_option_fills_remain_visible_but_are_not_exported(self):

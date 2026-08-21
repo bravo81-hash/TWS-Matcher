@@ -420,10 +420,41 @@ def _write_csv(path: str, rows: list[list]) -> None:
             os.unlink(tmp_path)
 
 
+def _supersede(path: str) -> None:
+    """Delete an export that a newer generation has replaced.
+
+    These CSVs are derived data -- any of them can be regenerated from
+    execution_journal.json -- so keeping a superseded copy beside the current
+    one buys nothing and actively invites importing the wrong file into ONE.
+    """
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def sweep_superseded(out_dir: str = OUT_DIR) -> int:
+    """Clear ``.stale`` leftovers from when superseded files were renamed.
+
+    Earlier versions parked replaced exports as ONEImport_*.csv.stale instead of
+    removing them, so the folder grew a copy per account per run.  Sweeping on
+    every save lets an existing folder heal itself.
+    """
+    if not os.path.isdir(out_dir):
+        return 0
+    removed = 0
+    for name in os.listdir(out_dir):
+        if name.startswith("ONEImport_") and name.endswith(".stale"):
+            _supersede(os.path.join(out_dir, name))
+            removed += 1
+    return removed
+
+
 def save_account_files(by_account: dict, completeness: dict,
                        out_dir: str = OUT_DIR) -> dict:
     """Atomically save safe imports and quarantine files that fail validation."""
     os.makedirs(out_dir, exist_ok=True)
+    sweep_superseded(out_dir)
     paths = {}
     accounts = set(by_account) | {
         account for account in completeness if account != "UNASSIGNED"
@@ -437,16 +468,13 @@ def save_account_files(by_account: dict, completeness: dict,
             out_dir, f"ONEImport_{account}_{POSSIBLY_INCOMPLETE}.csv")
         if status == COMPLETE and rows:
             _write_csv(normal, rows)
-            if os.path.exists(blocked):
-                os.replace(blocked, blocked + ".stale")
+            _supersede(blocked)
             paths[account] = normal
         elif status == COMPLETE:
-            if os.path.exists(normal):
-                os.replace(normal, normal + ".stale")
+            _supersede(normal)
             paths[account] = ""
         else:
-            if os.path.exists(normal):
-                os.replace(normal, normal + ".stale")
+            _supersede(normal)
             _write_csv(blocked, rows)
             paths[account] = blocked
     return paths
