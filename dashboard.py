@@ -825,11 +825,13 @@ def render_html() -> str:
         and time.time() - st["one_mtime"] > 3600
     )
     ghosts = (result or {}).get("ghost_trades", []) or []
+    unsettled = (result or {}).get("unsettled_trades", []) or []
     prob_n = (
         sum(1 for finds in result["accounts"].values() for f in finds
             if _alerting(f))
         + sum(active_unmapped.values())
         + len(ghosts)
+        + len(unsettled)
         if result else 0
     )
     if not result:
@@ -865,6 +867,37 @@ def render_html() -> str:
           "BUT THE ONE EXPORT IS STALE</h2>"
           "<div class='muted'>Export a fresh open-position report from ONE and "
           "click Check now before relying on this assurance.</div></div>")
+
+    if unsettled:
+        total = sum(t["pnl_if_worthless"] for t in unsettled)
+        p("<div class='acct' style='border:2px solid #d29922;background:#2d250d;"
+          "margin-bottom:14px'>"
+          f"<h2 style='color:#f2cc60;margin:0 0 4px'>⏰ {len(unsettled)} "
+          f"UNSETTLED EXPIR{'IES' if len(unsettled) > 1 else 'Y'} IN ONE</h2>"
+          "<div class='muted'>These legs expired in the market but are still "
+          "open in ONE, so ONE&rsquo;s realised P&amp;L for those trades is "
+          "wrong. The broker dropped them at expiry and the position check goes "
+          "quiet with it &mdash; accounts below can read MATCH while this money "
+          "is unbooked. Settle each trade in ONE.</div>")
+        for t in unsettled:
+            acct = t.get("ibkr_account") or t["account"]
+            legs = " &nbsp;·&nbsp; ".join(
+                f'{l["qty"]:+.0f} {html.escape(str(l["tradingClass"]))} '
+                f'{one_reader._pretty_expiry(l["expiry"])} '
+                f'{l["strike"]:g}{l["right"]} @ {l["open_price"]:.2f}'
+                for l in t["legs"])
+            p(f"<div style='margin-top:10px'><b>{html.escape(str(acct))}</b> "
+              f"&mdash; ONE trade <b>#{html.escape(str(t['trade_id']))}</b> "
+              f"{html.escape(str(t['trade_name']))} "
+              f"<span class='muted'>({html.escape(str(t['underlying']))}, "
+              f"expired {one_reader._pretty_expiry(t['expiry'])})</span>"
+              f"<div style='font-family:monospace;font-size:12px'>{legs}</div>"
+              f"<div class='muted' style='margin-top:2px'>Settles "
+              f"<b>{t['pnl_if_worthless']:+,.2f}</b> if expired worthless. "
+              f"Check moneyness first &mdash; an in-the-money leg was exercised "
+              f"or assigned and settles at intrinsic instead.</div></div>")
+        p(f"<div style='margin-top:10px'><b>Total if all expired worthless: "
+          f"{total:+,.2f}</b></div></div>")
 
     if ghosts:
         p("<div class='acct' style='border:2px solid #d29922;background:#2d250d;"

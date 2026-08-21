@@ -33,6 +33,7 @@ def one_leg(account="SMSF", **over):
         "tradingClass": "SPXW", "expiry": "20260808", "expiry_listed": "20260807",
         "strike": 7400.0, "right": "P", "multiplier": 100.0, "qty": -1.0,
         "open_price": 10.0, "is_open": True, "is_expired": False,
+        "unsettled_in_one": False, "trade_name": None,
         **over,
     }
 
@@ -240,6 +241,58 @@ class ReconciliationTests(unittest.TestCase):
             sorted(f["status"] for f in result["accounts"]["U1"]),
             ["IBKR_ONLY", "ONE_ONLY"],
         )
+
+    def test_expired_leg_still_open_in_one_is_reported_not_suppressed(self):
+        """The regression that hid a real assignment: at expiry IBKR drops the
+        contract and the reader stops counting it, so neither side can raise a
+        finding. ONE's P&L stays wrong until the trade is settled."""
+        legs = [
+            one_leg(trade_id="104", strike=380.0, qty=2.0, open_price=14.56,
+                    expiry_listed="20260821", unsettled_in_one=True,
+                    is_open=False, is_expired=True, trade_name="MSFT"),
+            one_leg(trade_id="104", strike=390.0, qty=-2.0, open_price=18.93,
+                    expiry_listed="20260821", unsettled_in_one=True,
+                    is_open=False, is_expired=True, trade_name="MSFT"),
+        ]
+        self.assertEqual(one_reader.net_positions(legs), [])   # not a position
+        [t] = one_reader.find_unsettled_trades(legs)
+        self.assertEqual(t["trade_id"], "104")
+        self.assertEqual(t["expiry"], "20260821")
+        # long 2 @14.56 costs 2912; short 2 @18.93 keeps 3786
+        self.assertAlmostEqual(t["pnl_if_worthless"], 874.0, places=2)
+
+    def test_leg_closed_in_one_before_expiry_is_not_unsettled(self):
+        settled = one_leg(is_open=False, is_expired=True,
+                          unsettled_in_one=False)
+        live = one_leg(is_open=True, is_expired=False)
+        self.assertEqual(one_reader.find_unsettled_trades([settled, live]), [])
+
+    def test_close_date_clears_the_unsettled_flag(self):
+        row = ["", "", "SMSF", "104", "", "Sell", "2",
+               "MSFT  260801P00390000", "31/07/2026", "Put", "",
+               "MSFT", "18.93", "", ""]
+        expired = one_reader.parse_leg_row(row)
+        self.assertTrue(expired["unsettled_in_one"])
+        row[14] = "22/08/2026 5:00:00 AM"          # CloseDate present
+        self.assertFalse(one_reader.parse_leg_row(row)["unsettled_in_one"])
+
+    def test_unsettled_expiry_breaks_the_all_clear(self):
+        result = reconcile.reconcile_snapshots(
+            {"captured_at": "now", "fills_today": [], "legs": []},
+            {"source_file": "report.csv", "positions": [],
+             "unsettled_trades": [{
+                 "account": "A14+HV7", "trade_id": "104",
+                 "trade_name": "MSFT", "underlying": "MSFT",
+                 "expiry": "20260821", "pnl_if_worthless": 874.0,
+                 "legs": [{"tradingClass": "MSFT", "expiry": "20260821",
+                           "strike": 390.0, "right": "P", "qty": -2.0,
+                           "open_price": 18.93}],
+             }]},
+            config(),
+        )
+        self.assertEqual(result["accounts"], {})       # nothing reconcilable
+        [t] = result["unsettled_trades"]
+        self.assertEqual(t["ibkr_account"], "U1")
 
     def test_ghost_trade_is_detected_from_zero_risk(self):
         legs = [{**one_leg(), "trade_id": "154"}]

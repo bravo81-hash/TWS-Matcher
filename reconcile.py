@@ -767,11 +767,21 @@ def reconcile_snapshots(ibkr_snapshot, one_snapshot, cfg):
                        "ibkr_account": resolve_one_account(g["account"],
                                                            account_map)})
 
+    # Expired-but-unsettled legs leave BOTH sides at once -- IBKR drops the
+    # contract, this reader stops counting it -- so they can never show up as a
+    # finding either.  Carry them through or the day after expiry looks clean.
+    unsettled = []
+    for t in one_snapshot.get("unsettled_trades", []) or []:
+        unsettled.append({**t,
+                          "ibkr_account": resolve_one_account(t["account"],
+                                                              account_map)})
+
     return {
         "reconciled_at": datetime.now(timezone.utc).isoformat(),
         "ibkr_source": ibkr_snapshot.get("captured_at"),
         "one_source": one_snapshot.get("source_file"),
         "ghost_trades": ghosts,
+        "unsettled_trades": unsettled,
         "one_source_mtime": one_source_mtime,
         "tolerances": tol,
         "accounts": by_account,
@@ -795,6 +805,7 @@ def main():
     print_report(result["accounts"], unmapped, set(result["ignore_one_accounts"]),
                  accounts)
     one_reader.print_ghost_trades(result.get("ghost_trades", []))
+    one_reader.print_unsettled_trades(result.get("unsettled_trades", []))
 
     with open(OUTPUT_JSON, "w") as fh:
         json.dump(result, fh, indent=2, default=str)

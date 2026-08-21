@@ -183,6 +183,11 @@ def parse_leg_row(row: list[str], cols: dict | None = None) -> dict | None:
     # it is no longer an economic position and must not become ONE_ONLY.
     expired = is_expired(expiry_listed or expiry)
     is_open = close_date == "" and not expired
+    # ONE never books an expiry for you.  A leg past its expiration that still
+    # carries no CloseDate is not a position any more -- keeping it out of
+    # net_positions is right -- but ONE's P&L for that trade stays wrong until
+    # it is settled, so track it for find_unsettled_trades().
+    unsettled = expired and close_date == ""
 
     return {
         "account": account,
@@ -198,6 +203,7 @@ def parse_leg_row(row: list[str], cols: dict | None = None) -> dict | None:
         "open_price": avg_open,              # ONE's recorded per-share commit price
         "is_open": is_open,
         "is_expired": expired,
+        "unsettled_in_one": unsettled,
         "symbol": symbol,
     }
 
@@ -417,6 +423,32 @@ def print_ghost_trades(ghosts: list[dict]) -> None:
     print()
 
 
+def print_unsettled_trades(trades: list[dict]) -> None:
+    if not trades:
+        return
+    print("!" * 74)
+    print(f"UNSETTLED EXPIRIES  ({len(trades)})  --  expired in the market, still")
+    print("open in ONE.  ONE's realised P&L for these trades is wrong until you")
+    print("settle them; the broker and this check both went quiet at expiry.")
+    print("!" * 74)
+    total = 0.0
+    for t in trades:
+        total += t["pnl_if_worthless"]
+        print()
+        print(f"  [{t['account']}]  #{t['trade_id']}  {t['trade_name']}"
+              f"   ({t['underlying']}, expired {_pretty_expiry(t['expiry'])})")
+        for l in t["legs"]:
+            lbl = (f'{l["tradingClass"]} {_pretty_expiry(l["expiry"])} '
+                   f'{l["strike"]:g}{l["right"]}')
+            print(f'      {lbl:<30}{l["qty"]:>7.0f} @ {l["open_price"]:.2f}')
+        print(f"    settles {t['pnl_if_worthless']:+,.2f} if expired worthless "
+              f"-- check moneyness; an ITM leg was exercised or assigned and "
+              f"settles at intrinsic instead.")
+    print()
+    print(f"  TOTAL if all expired worthless: {total:+,.2f}")
+    print()
+
+
 def find_default_csv(search_dirs=None) -> str:
     """Newest supported ONE report in Downloads/Documents, else sample."""
     dirs = search_dirs or DEFAULT_EXPORT_DIRS
@@ -506,6 +538,51 @@ def find_ghost_trades(trade_rows: list[dict], legs: list[dict]) -> list[dict]:
     return ghosts
 
 
+def find_unsettled_trades(legs: list[dict]) -> list[dict]:
+    """ONE trades holding legs that expired but were never settled.
+
+    IBKR drops an expired option from positions, and this reader stops treating
+    it as open, so the leg quietly leaves the reconciliation on the day after
+    expiry -- both sides go silent and every account reads MATCH.  ONE, though,
+    only books the expiry when the user does, so the trade's realised P&L stays
+    wrong, by the whole value of the legs, indefinitely.
+
+    ``pnl_if_worthless`` is what ONE will realise if the legs are settled at
+    zero.  That is the common case but not the only one: a leg that finished in
+    the money was exercised or assigned and has to be settled at its intrinsic
+    value instead, so the figure is a reference, not an instruction.
+    """
+    grouped = defaultdict(list)
+    for lg in legs:
+        if lg.get("unsettled_in_one"):
+            grouped[(lg["account"], lg.get("trade_id"))].append(lg)
+
+    out = []
+    for (acct, tid), tlegs in grouped.items():
+        name = next((l.get("trade_name") for l in tlegs if l.get("trade_name")),
+                    None) or (f"Trade #{tid}" if tid else "Open Trade")
+        pnl = sum(-l["qty"] * l["open_price"] * (l.get("multiplier") or
+                                                 DEFAULT_MULTIPLIER)
+                  for l in tlegs)
+        out.append({
+            "account": acct,
+            "trade_id": tid,
+            "trade_name": name,
+            "underlying": next((l.get("underlying") for l in tlegs
+                                if l.get("underlying")), None),
+            "expiry": min(l.get("expiry_listed") or l["expiry"] for l in tlegs),
+            "pnl_if_worthless": round(pnl, 2),
+            "legs": [{
+                "tradingClass": l["tradingClass"],
+                "expiry": match_expiry(l), "strike": l["strike"],
+                "right": l["right"], "qty": l["qty"],
+                "open_price": l["open_price"],
+            } for l in sorted(tlegs, key=lambda x: (x["right"], x["strike"]))],
+        })
+    out.sort(key=lambda t: (t["expiry"], t["account"], str(t["trade_id"])))
+    return out
+
+
 def build_one_snapshot(path: str) -> dict:
     """Read a ONE Summary Report CSV -> canonical ONE snapshot dict.
     Reused by the dashboard daemon (no console output / file write)."""
@@ -522,6 +599,7 @@ def build_one_snapshot(path: str) -> dict:
         "positions": positions,
         "trades": trades,
         "ghost_trades": find_ghost_trades(trade_rows, legs),
+        "unsettled_trades": find_unsettled_trades(legs),
         "raw_legs": legs,
     }
 
@@ -538,6 +616,7 @@ def main() -> None:
 
     print_table(positions)
     print_ghost_trades(ghosts)
+    print_unsettled_trades(snapshot["unsettled_trades"])
 
     with open(OUTPUT_JSON, "w") as fh:
         json.dump(snapshot, fh, indent=2, default=str)

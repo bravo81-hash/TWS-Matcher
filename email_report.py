@@ -128,7 +128,9 @@ def generate_report_html(
         if one_reader.normalize_account_name(name) not in ignored
     }
     ghosts = result.get("ghost_trades", []) or []
-    issue_count = len(actionable) + sum(unmapped.values()) + len(ghosts)
+    unsettled = result.get("unsettled_trades", []) or []
+    issue_count = (len(actionable) + sum(unmapped.values()) + len(ghosts)
+                   + len(unsettled))
     one_mtime = result.get("one_source_mtime") or one_snap.get("source_mtime")
     if not one_mtime and one_path and os.path.exists(one_path):
         one_mtime = os.path.getmtime(one_path)
@@ -246,6 +248,25 @@ HTML file is opened in a browser.</div>
         parts.append(
             "<div class='warnbox'><b>Unmapped ONE account group(s):</b> "
             f"{group_text}. The comparison is not trustworthy until mapped.</div>")
+
+    for trade in unsettled:
+        legs_text = " · ".join(
+            f'{leg["qty"]:+.0f} {leg["tradingClass"]} '
+            f'{one_reader._pretty_expiry(leg["expiry"])} '
+            f'{leg["strike"]:g}{leg["right"]} @ {leg["open_price"]:.2f}'
+            for leg in trade["legs"])
+        parts.append(
+            "<div class='warnbox'><b>Unsettled expiry in ONE &mdash; "
+            f"{_escape(str(trade.get('ibkr_account') or trade['account']))} "
+            f"#{_escape(str(trade['trade_id']))} "
+            f"{_escape(str(trade['trade_name']))}.</b> "
+            "These legs expired in the market but are still open in ONE, so "
+            "ONE's realised P&amp;L for the trade is wrong. The broker dropped "
+            "them at expiry and the position check goes quiet with them. "
+            f"<br><span style='font-family:monospace'>{_escape(legs_text)}</span>"
+            f"<br>Settles <b>{trade['pnl_if_worthless']:+,.2f}</b> if expired "
+            "worthless; an in-the-money leg was exercised or assigned and "
+            "settles at intrinsic instead.</div>")
 
     for ghost in ghosts:
         legs_text = " · ".join(
