@@ -45,6 +45,7 @@ from ib_async import IB
 import canonical_engine as eng
 import email_report
 import flex_export
+import market_metrics
 import naming_check
 import one_reader
 import optionstrat_reader
@@ -62,7 +63,8 @@ ET = ZoneInfo("America/New_York")
 _lock = threading.Lock()
 _state: dict = {"status": "starting", "result": None, "error": None,
                 "last_cycle": None, "ibkr_connected": False, "one_file": None,
-                "one_mtime": None, "ibkr_snap": None, "one_snap": None}
+                "one_mtime": None, "ibkr_snap": None, "one_snap": None,
+                "metrics": None, "metrics_at": None, "metrics_error": None}
 _check_now = threading.Event()
 
 
@@ -127,6 +129,58 @@ def worker():
         now_et = datetime.now(ET)
         delay = POLL_RTH if is_rth(now_et) else POLL_OFF
         _wait(ib, delay)
+
+
+# Greeks and per-position P&L cost ~40s and consume market-data lines, so they
+# run on their own slower clock rather than every reconciliation cycle.
+METRICS_INTERVAL = 300
+NAV_HISTORY = os.path.join(HERE, "nav_history.json")
+_metrics_last = [0.0]
+
+
+def _log_nav(metrics: dict) -> None:
+    """Append today's NAV to the equity curve, one row per calendar day.
+
+    IBKR has no historical-NAV API, so the curve can only be built forward from
+    the first day this runs. Re-running the same day overwrites that day's row
+    rather than adding a second one.
+    """
+    try:
+        try:
+            with open(NAV_HISTORY) as fh:
+                hist = json.load(fh)
+        except (OSError, ValueError):
+            hist = []
+        day = datetime.now(ET).strftime("%Y-%m-%d")
+        row = {
+            "date": day,
+            "nav_total": metrics.get("nav_total"),
+            "accounts": {a: d.get("NetLiquidation")
+                         for a, d in (metrics.get("accounts") or {}).items()},
+            "daily_pnl": sum(t.get("daily_pnl") or 0.0
+                             for t in metrics.get("by_ticker") or []),
+        }
+        hist = [r for r in hist if r.get("date") != day] + [row]
+        hist.sort(key=lambda r: r["date"])
+        with open(NAV_HISTORY, "w") as fh:
+            json.dump(hist, fh, indent=2)
+    except Exception:
+        pass          # the equity log must never take the daemon down
+
+
+def maybe_collect_metrics(ib: IB, cfg: dict, force: bool = False) -> None:
+    if not force and time.time() - _metrics_last[0] < METRICS_INTERVAL:
+        return
+    _metrics_last[0] = time.time()
+    try:
+        _set(status="collecting greeks")
+        accounts = set(cfg.get("account_map", {}).values()) or None
+        m = market_metrics.collect_all(ib, accounts)
+        _log_nav(m)
+        _set(metrics=m, metrics_at=datetime.now(timezone.utc).isoformat(),
+             metrics_error=None)
+    except Exception as exc:
+        _set(metrics_error=f"{type(exc).__name__}: {exc}")
 
 
 def run_cycle(ib: IB, cfg: dict):
@@ -194,6 +248,8 @@ def run_cycle(ib: IB, cfg: dict):
     # persist latest for other tools
     with open(reconcile.OUTPUT_JSON, "w") as fh:
         json.dump(result, fh, indent=2, default=str)
+
+    maybe_collect_metrics(ib, cfg)
 
 
 def _wait(ib: IB, seconds: float):
@@ -692,6 +748,7 @@ function escapeHtml(str) {
 
 def nav_html(active: str) -> str:
     items = [("dashboard", "/", "Dashboard"),
+             ("risk", "/risk", "Risk & Greeks"),
              ("oneos", "/oneos", "ONE ↔ OptionStrat"),
              ("guide", "/guide", "Guide"),
              ("naming", "/naming", "Naming convention")]
@@ -1485,6 +1542,193 @@ _ONEOS_COLORS = {"QTY_MISMATCH": "#cf222e", "PRICE_DIFF": "#9a6700",
                  "ONE_ONLY": "#8250df", "OS_ONLY": "#0969da", "MATCH": "#1a7f37"}
 
 
+def _m(v, spec=",.0f", dash="&mdash;", suffix=""):
+    """Format a metric, colouring the sign, or an em dash when absent."""
+    if v is None:
+        return f"<span class='muted'>{dash}</span>"
+    try:
+        txt = format(v, spec) + suffix
+    except (TypeError, ValueError):
+        return html.escape(str(v))
+    if isinstance(v, (int, float)) and v < 0:
+        return f"<span style='color:#ff7b72'>{txt}</span>"
+    return txt
+
+
+def _headroom_cell(pct):
+    """Liquidity headroom, coloured by how close a margin call is."""
+    if pct is None:
+        return "<span class='muted'>&mdash;</span>"
+    colour = "#3fb950" if pct >= 40 else "#f2cc60" if pct >= 20 else "#ff7b72"
+    return f"<b style='color:{colour}'>{pct:.1f}%</b>"
+
+
+def _iv_cell(rank):
+    """IV rank, coloured for a premium seller: low rank is poor conditions."""
+    if rank is None:
+        return "<span class='muted'>&mdash;</span>"
+    colour = "#ff7b72" if rank < 20 else "#f2cc60" if rank < 40 else "#3fb950"
+    return f"<b style='color:{colour}'>{rank:.0f}</b>"
+
+
+def render_risk_html() -> str:
+    with _lock:
+        st = dict(_state)
+    m = st.get("metrics")
+    out = []
+    p = out.append
+    p(_page_head("Risk & Greeks &mdash; TWS Matcher", refresh_secs=60))
+    p(nav_html("risk"))
+    p("<h1>Risk &amp; Greeks</h1>")
+
+    if st.get("metrics_error"):
+        p(f"<div class='acct' style='border-color:#cf222e'><b class='warn'>"
+          f"Metrics error:</b> {html.escape(str(st['metrics_error']))}</div>")
+    if not m:
+        p("<p class='muted'>Waiting for the first Greeks collection "
+          "(runs every 5 minutes; it needs option market data)&hellip;</p>")
+        return "".join(out) + "</body></html>"
+
+    p(f"<div class='sub'>collected {html.escape(str(st.get('metrics_at')))} UTC "
+      f"&nbsp;|&nbsp; refreshed every {METRICS_INTERVAL // 60} min</div>")
+
+    # ---- accounts / margin
+    p("<h2>Accounts &amp; margin</h2>")
+    p("<table><tr><th>account</th><th>NAV</th><th>cash</th>"
+      "<th>gross position</th><th>init margin</th><th>maint margin</th>"
+      "<th>excess liquidity</th><th>headroom</th><th>init util</th></tr>")
+    for acct, d in sorted((m.get("accounts") or {}).items()):
+        cur = d.get("currency") or ""
+        p(f"<tr><td><b>{html.escape(acct)}</b></td>"
+          f"<td>{_m(d.get('NetLiquidation'))} {cur}</td>"
+          f"<td>{_m(d.get('TotalCashValue'))}</td>"
+          f"<td>{_m(d.get('GrossPositionValue'))}</td>"
+          f"<td>{_m(d.get('FullInitMarginReq'))}</td>"
+          f"<td>{_m(d.get('FullMaintMarginReq'))}</td>"
+          f"<td>{_m(d.get('ExcessLiquidity'))}</td>"
+          f"<td>{_headroom_cell(d.get('headroom_pct'))}</td>"
+          f"<td>{_m(d.get('init_margin_util_pct'), '.0f', suffix='%')}</td></tr>")
+    p("</table>")
+    p("<div class='muted'>Headroom is excess liquidity over net liquidation: "
+      "how far the account can fall before a margin call. Amber under 40%, "
+      "red under 20%.</div>")
+
+    # ---- cost-basis P&L divergence (from the reconciliation, not market data)
+    div = (st.get("result") or {}).get("pnl_divergence") or {}
+    if div.get("worst"):
+        p("<h2>Cost-basis P&amp;L divergence &mdash; ONE vs IBKR</h2>")
+        p(f"<div class='sub'>Net <b>{_m(div.get('net'), '+,.0f')}</b> &nbsp;|&nbsp; "
+          f"gross <b>{_m(div.get('gross'))}</b> across "
+          f"{len(div.get('worst', []))}+ legs</div>")
+        p("<div class='muted'>ONE reports no P&amp;L for an open leg, so this "
+          "prices the consequence instead: when these positions close, ONE will "
+          "report this many dollars more profit than IBKR purely because the two "
+          "cost bases disagree. Gross matters more than net &mdash; offsetting "
+          "legs can hide a large disagreement inside a small net.</div>")
+        p("<table><tr><th>account</th><th>instrument</th><th>status</th>"
+          "<th>px delta</th><th>P&amp;L divergence</th></tr>")
+        for r in div["worst"]:
+            p(f"<tr><td>{html.escape(str(r['account']))}</td>"
+              f"<td>{html.escape(str(r['label']))}</td>"
+              f"<td>{html.escape(str(r['status']))}</td>"
+              f"<td>{_m(r.get('px_delta'), '+.4f')}</td>"
+              f"<td><b>{_m(r.get('pnl_divergence'), '+,.0f')}</b></td></tr>")
+        p("</table>")
+        if div.get("by_ticker"):
+            rows = " &nbsp;·&nbsp; ".join(
+                f"{html.escape(str(k))} {v:+,.0f}"
+                for k, v in sorted(div["by_ticker"].items(), key=lambda x: -abs(x[1])))
+            p(f"<div class='muted' style='margin-top:6px'>by ticker: {rows}</div>")
+
+    # ---- equity curve
+    try:
+        with open(NAV_HISTORY) as fh:
+            hist = json.load(fh)
+    except (OSError, ValueError):
+        hist = []
+    p("<h2>Equity curve</h2>")
+    if len(hist) < 2:
+        p(f"<div class='muted'>Logging NAV daily &mdash; {len(hist)} day(s) so far. "
+          "IBKR has no historical-NAV API, so this curve can only build forward "
+          "from today. For history before that, a Flex Web Service token and a "
+          "NAV query are needed.</div>")
+    else:
+        first, last = hist[0], hist[-1]
+        chg = (last.get("nav_total") or 0) - (first.get("nav_total") or 0)
+        base = first.get("nav_total") or 0
+        p("<table><tr><th>date</th><th>NAV</th><th>day P&amp;L</th></tr>")
+        for r in hist[-30:]:
+            p(f"<tr><td>{html.escape(str(r.get('date')))}</td>"
+              f"<td>{_m(r.get('nav_total'))}</td>"
+              f"<td>{_m(r.get('daily_pnl'), '+,.0f')}</td></tr>")
+        p("</table>")
+        p(f"<div class='muted'>{len(hist)} days logged &mdash; "
+          f"{html.escape(str(first.get('date')))} to "
+          f"{html.escape(str(last.get('date')))}: {_m(chg, '+,.0f')}"
+          f" ({_m(chg / base * 100 if base else None, '+.2f', suffix='%')})</div>")
+
+    # ---- per ticker
+    tick = m.get("by_ticker") or []
+    book_theta = sum(t.get("theta") or 0 for t in tick)
+    book_vega = sum(t.get("vega") or 0 for t in tick)
+    book_daily = sum(t.get("daily_pnl") or 0 for t in tick)
+    nav = m.get("nav_total") or 0
+    p("<h2>Per ticker</h2>")
+    p("<table><tr><th>ticker</th><th>delta $</th><th>theta / day</th>"
+      "<th>vega</th><th>gamma</th><th>daily P&amp;L</th><th>daily %</th>"
+      "<th>% NAV</th><th>unrealised</th><th>IV</th><th>IVR</th><th>IVP</th>"
+      "<th>IV 1d</th><th>legs</th></tr>")
+    for t in tick:
+        iv = t.get("iv")
+        p(f"<tr><td><b>{html.escape(str(t['underlying']))}</b></td>"
+          f"<td>{_m(t.get('delta_dollars'))}</td><td>{_m(t.get('theta'))}</td>"
+          f"<td>{_m(t.get('vega'))}</td><td>{_m(t.get('gamma'), ',.1f')}</td>"
+          f"<td>{_m(t.get('daily_pnl'))}</td>"
+          f"<td>{_m(t.get('daily_pnl_pct'), '.2f', suffix='%')}</td>"
+          f"<td>{_m(t.get('daily_pnl_pct_nav'), '.2f', suffix='%')}</td>"
+          f"<td>{_m(t.get('unrealized_pnl'))}</td>"
+          f"<td>{_m(iv * 100 if iv else None, '.1f', suffix='%')}</td>"
+          f"<td>{_iv_cell(t.get('iv_rank'))}</td>"
+          f"<td>{_m(t.get('iv_percentile'), '.0f')}</td>"
+          f"<td>{_m(t.get('chg_pct'), '+.1f', suffix='%')}</td>"
+          f"<td>{t.get('positions')}</td></tr>")
+    p(f"<tr><td><b>BOOK</b></td><td></td><td><b>{_m(book_theta)}</b></td>"
+      f"<td><b>{_m(book_vega)}</b></td><td></td>"
+      f"<td><b>{_m(book_daily)}</b></td><td></td>"
+      f"<td><b>{_m(book_daily / nav * 100 if nav else None, '.2f', suffix='%')}</b></td>"
+      f"<td colspan='5'></td><td></td></tr>")
+    p("</table>")
+    p("<div class='muted'>Delta $ is delta &times; underlying price, so tickers "
+      "compare directly. Daily % is measured against gross prior value (a "
+      "spread's net value nets toward zero and would give nonsense); % NAV is "
+      "the contribution to account equity. IV rank is red below 20 &mdash; "
+      "poor conditions to be selling premium.</div>")
+
+    # ---- per expiry
+    p("<h2>Per expiry</h2>")
+    p("<table><tr><th>ticker</th><th>expiry</th><th>delta $</th>"
+      "<th>theta / day</th><th>vega</th><th>gamma</th><th>daily P&amp;L</th>"
+      "<th>daily %</th><th>unrealised</th><th>legs</th></tr>")
+    for e in m.get("by_expiry") or []:
+        p(f"<tr><td>{html.escape(str(e['underlying']))}</td>"
+          f"<td>{html.escape(str(e.get('expiry_label')))}</td>"
+          f"<td>{_m(e.get('delta_dollars'))}</td><td>{_m(e.get('theta'))}</td>"
+          f"<td>{_m(e.get('vega'))}</td><td>{_m(e.get('gamma'), ',.1f')}</td>"
+          f"<td>{_m(e.get('daily_pnl'))}</td>"
+          f"<td>{_m(e.get('daily_pnl_pct'), '.2f', suffix='%')}</td>"
+          f"<td>{_m(e.get('unrealized_pnl'))}</td>"
+          f"<td>{e.get('positions')}</td></tr>")
+    p("</table>")
+
+    missing = sum(t.get("greeks_missing") or 0 for t in tick)
+    if missing:
+        p(f"<div class='warnbox'><b>{missing} leg(s) returned no Greeks</b> and "
+          "are excluded from the delta/theta/vega totals, so those totals "
+          "understate the book. Usually a missing market-data permission or a "
+          "contract that was not quoting when the snapshot was taken.</div>")
+    return "".join(out) + "</body></html>"
+
+
 def render_oneos_html() -> str:
     with _lock:
         st = dict(_state)
@@ -1687,6 +1931,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/naming"):
             body = render_naming_html().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.startswith("/risk"):
+            body = render_risk_html().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()

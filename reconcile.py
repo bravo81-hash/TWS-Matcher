@@ -84,6 +84,36 @@ def resolve_one_account(account, account_map):
     return account_map.get(raw) or account_map.get(normalize_account_name(raw))
 
 
+def summarise_pnl_divergence(by_account: dict) -> dict:
+    """Total dollars by which ONE's cost basis will misreport P&L vs IBKR.
+
+    Rolled up per account and per underlying. ``gross`` sums the absolute
+    divergences: offsetting legs can hide a large per-leg disagreement inside a
+    small net, and the gross figure is what says how much is actually adrift.
+    """
+    total = gross = 0.0
+    per_account: dict = defaultdict(float)
+    per_ticker: dict = defaultdict(float)
+    worst = []
+    for acct, findings in (by_account or {}).items():
+        for f in findings:
+            d = f.get("pnl_divergence")
+            if not d:
+                continue
+            total += d
+            gross += abs(d)
+            per_account[acct] += d
+            per_ticker[f.get("underlying") or f.get("label", "?").split()[0]] += d
+            worst.append({"account": acct, "label": f.get("label"),
+                          "status": f.get("status"), "px_delta": f.get("px_delta"),
+                          "pnl_divergence": d})
+    worst.sort(key=lambda r: -abs(r["pnl_divergence"]))
+    return {"net": round(total, 2), "gross": round(gross, 2),
+            "by_account": {k: round(v, 2) for k, v in per_account.items()},
+            "by_ticker": {k: round(v, 2) for k, v in per_ticker.items()},
+            "worst": worst[:15]}
+
+
 def is_expected_finding(finding):
     return bool(finding.get("expected"))
 
@@ -501,7 +531,8 @@ def net_ibkr(legs, fill_map=None):
                                     "expiry": lg.get("expiry"), "qty": 0.0,
                                     "num": 0.0, "den": 0.0,
                                     "underlying": lg.get("underlying"),
-                                    "secType": lg.get("secType")})
+                                    "secType": lg.get("secType"),
+                                    "multiplier": float(lg.get("multiplier") or 100)})
         b["qty"] += lg["qty"]
         b["num"] += abs(lg["qty"]) * lg["avg_price"]
         b["den"] += abs(lg["qty"])
@@ -634,10 +665,19 @@ def _compare(ir, orow, expiry_dist, tol):
             else "MATCH_FIFO_AVG"
     else:
         status = "MATCH"
+    # ONE's report carries no P&L for an OPEN leg, so unrealised P&L cannot be
+    # diffed directly. What can be priced exactly is the consequence of the two
+    # cost bases disagreeing: when the position is closed, ONE will report this
+    # many dollars more profit than IBKR. Positive = ONE flatters the result.
+    mult = float(ir.get("multiplier") or orow.get("multiplier") or 100)
+    divergence = ((ir["avg_price"] - orow["avg_price"]) * orow["qty"] * mult
+                  if qty_ok else None)
     return {"status": status, "label": label_from_bucket(ir),
             "ibkr_qty": ir["qty"], "ibkr_px": ir["avg_price"],
             "one_qty": orow["qty"], "one_px": orow["avg_price"],
             "px_delta": round(ir["avg_price"] - orow["avg_price"], 4),
+            "pnl_divergence": round(divergence, 2) if divergence is not None else None,
+            "underlying": ir.get("underlying") or orow.get("underlying"),
             "expiry_ibkr": ir["expiry"], "expiry_one": orow["expiry"],
             "expiry_offset_days": expiry_dist}
 
@@ -777,6 +817,7 @@ def reconcile_snapshots(ibkr_snapshot, one_snapshot, cfg):
                                                               account_map)})
 
     return {
+        "pnl_divergence": summarise_pnl_divergence(by_account),
         "reconciled_at": datetime.now(timezone.utc).isoformat(),
         "ibkr_source": ibkr_snapshot.get("captured_at"),
         "one_source": one_snapshot.get("source_file"),

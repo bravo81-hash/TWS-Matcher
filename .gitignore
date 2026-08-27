@@ -8,6 +8,9 @@ canonical_positions.json
 one_positions.json
 reconciliation.json
 optionstrat_urls.json
+metrics_snapshot.json
+iv_cache.json
+nav_history.json
 flex_export/
 
 # Private exports and local working material

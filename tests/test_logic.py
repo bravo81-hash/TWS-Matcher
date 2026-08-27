@@ -294,6 +294,46 @@ class ReconciliationTests(unittest.TestCase):
         [t] = result["unsettled_trades"]
         self.assertEqual(t["ibkr_account"], "U1")
 
+    def test_cost_basis_gap_is_priced_in_dollars(self):
+        """ONE reports no P&L for an open leg, so the divergence is the signal."""
+        result = reconcile.reconcile_snapshots(
+            {"captured_at": "now", "fills_today": [], "legs": [
+                {**option(account="U1", qty=-4.0), "avg_price": 25.71,
+                 "multiplier": 100.0}]},
+            {"source_file": "r.csv", "positions": [
+                {**option(qty=-4.0), "avg_price": 25.00}]},
+            config(),
+        )
+        [f] = result["accounts"]["U1"]
+        # IBKR cost 25.71 vs ONE 25.00 on -4 lots: ONE will overstate by 284
+        self.assertAlmostEqual(f["pnl_divergence"], (25.71 - 25.00) * -4 * 100, 2)
+        summary = result["pnl_divergence"]
+        self.assertAlmostEqual(summary["net"], f["pnl_divergence"], 2)
+        self.assertAlmostEqual(summary["gross"], abs(f["pnl_divergence"]), 2)
+        self.assertEqual(summary["by_account"]["U1"], f["pnl_divergence"])
+
+    def test_offsetting_divergences_net_out_but_gross_still_reports(self):
+        """A small net can hide two large, opposite per-leg disagreements."""
+        summary = reconcile.summarise_pnl_divergence({"U1": [
+            {"pnl_divergence": 5000.0, "label": "SPX 7000P", "underlying": "SPX"},
+            {"pnl_divergence": -4900.0, "label": "SPX 7100P", "underlying": "SPX"},
+        ]})
+        self.assertAlmostEqual(summary["net"], 100.0, 2)
+        self.assertAlmostEqual(summary["gross"], 9900.0, 2)
+        self.assertEqual(len(summary["worst"]), 2)
+
+    def test_quantity_mismatch_has_no_meaningful_divergence(self):
+        result = reconcile.reconcile_snapshots(
+            {"captured_at": "now", "fills_today": [], "legs": [
+                {**option(account="U1", qty=-4.0), "avg_price": 25.71}]},
+            {"source_file": "r.csv", "positions": [
+                {**option(qty=-2.0), "avg_price": 25.00}]},
+            config(),
+        )
+        [f] = result["accounts"]["U1"]
+        self.assertEqual(f["status"], "QTY_MISMATCH")
+        self.assertIsNone(f["pnl_divergence"])
+
     def test_ghost_trade_is_detected_from_zero_risk(self):
         legs = [{**one_leg(), "trade_id": "154"}]
         trades = [trade_row(trade_id="154", name="", margin=0.0)]
