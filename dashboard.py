@@ -270,10 +270,12 @@ def _set(**kw):
 
 # --------------------------------------------------------------- rendering
 STATUS_COLORS = {
-    "MATCH": "#1a7f37", "MATCH_FIFO_AVG": "#0969da", "PRICE_DRIFT": "#9a6700", "QTY_MISMATCH": "#cf222e",
+    "MATCH": "#1a7f37", "MATCH_FIFO_AVG": "#0969da", "PRICE_DRIFT": "#9a6700",
+    "COST_BASIS_DRIFT": "#bc4c00", "QTY_MISMATCH": "#cf222e",
     "IBKR_ONLY": "#0969da", "ONE_ONLY": "#8250df",
 }
-ORDER = ["QTY_MISMATCH", "ONE_ONLY", "IBKR_ONLY", "PRICE_DRIFT", "MATCH_FIFO_AVG", "MATCH"]
+ORDER = ["QTY_MISMATCH", "ONE_ONLY", "IBKR_ONLY", "PRICE_DRIFT",
+         "COST_BASIS_DRIFT", "MATCH_FIFO_AVG", "MATCH"]
 
 PAGE_STYLE = (
     "body{font:12.5px/1.35 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;"
@@ -1612,6 +1614,56 @@ def render_risk_html() -> str:
     p("<div class='muted'>Headroom is excess liquidity over net liquidation: "
       "how far the account can fall before a margin call. Amber under 40%, "
       "red under 20%.</div>")
+
+    # ---- assignment risk first: it is the only thing here that can happen tonight
+    radar = m.get("radar") or {}
+    risk = radar.get("assignment_risk") or []
+    if risk:
+        p("<div class='acct' style='border:2px solid #cf222e;background:#2d1416;"
+          "margin-bottom:14px'>"
+          f"<h2 style='color:#ff7b72;margin:0 0 4px'>&#9888; {len(risk)} SHORT "
+          f"OPTION{'S' if len(risk) > 1 else ''} AT EARLY-ASSIGNMENT RISK</h2>"
+          "<div class='muted'>In the money with almost no extrinsic value left, "
+          "so the holder gives up nothing by exercising. Assignment turns these "
+          "into stock overnight, without any execution reaching this tool. "
+          "Index options are excluded &mdash; they are cash settled and cannot "
+          "be assigned early.</div>")
+        p("<table><tr><th>account</th><th>contract</th><th>qty</th><th>DTE</th>"
+          "<th>spot</th><th>intrinsic</th><th>extrinsic</th><th>delta</th></tr>")
+        for r in risk:
+            p(f"<tr><td>{html.escape(str(r['account']))}</td>"
+              f"<td><b>{html.escape(str(r['underlying']))} "
+              f"{html.escape(str(r['expiry_label']))} "
+              f"{r['strike']:g}{r['right']}</b></td>"
+              f"<td>{r['qty']:+.0f}</td><td>{r['dte']}</td>"
+              f"<td>{_m(r.get('spot'), ',.2f')}</td>"
+              f"<td>{_m(r.get('intrinsic'), ',.2f')}</td>"
+              f"<td><b style='color:#ff7b72'>{_m(r.get('extrinsic'), ',.2f')}</b></td>"
+              f"<td>{_m(r.get('delta'), '.3f')}</td></tr>")
+        p("</table></div>")
+
+    # ---- expiries needing attention
+    exp = radar.get("expiring") or []
+    if exp:
+        itm = [r for r in exp if r["itm"]]
+        p(f"<h2>Expiring within {radar.get('within_days', 7)} days</h2>")
+        p(f"<div class='muted'>{len(exp)} leg(s), {len(itm)} in the money. "
+          "In-the-money legs settle for cash or become stock; either way ONE "
+          "will not book it for you.</div>")
+        p("<table><tr><th>account</th><th>contract</th><th>qty</th><th>DTE</th>"
+          "<th>spot</th><th>moneyness</th><th>delta</th><th>settles</th></tr>")
+        for r in exp:
+            tag = ("<b style='color:#f2cc60'>ITM</b>" if r["itm"]
+                   else "<span class='muted'>OTM</span>")
+            p(f"<tr><td>{html.escape(str(r['account']))}</td>"
+              f"<td>{html.escape(str(r['underlying']))} "
+              f"{html.escape(str(r['expiry_label']))} "
+              f"{r['strike']:g}{r['right']}</td>"
+              f"<td>{r['qty']:+.0f}</td><td>{r['dte']}</td>"
+              f"<td>{_m(r.get('spot'), ',.2f')}</td><td>{tag}</td>"
+              f"<td>{_m(r.get('delta'), '.3f')}</td>"
+              f"<td>{'cash' if r['cash_settled'] else 'shares'}</td></tr>")
+        p("</table>")
 
     # ---- cost-basis P&L divergence (from the reconciliation, not market data)
     div = (st.get("result") or {}).get("pnl_divergence") or {}

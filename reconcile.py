@@ -672,6 +672,13 @@ def _compare(ir, orow, expiry_dist, tol):
     mult = float(ir.get("multiplier") or orow.get("multiplier") or 100)
     divergence = ((ir["avg_price"] - orow["avg_price"]) * orow["qty"] * mult
                   if qty_ok else None)
+    # MATCH_FIFO_AVG exists to excuse IBKR's FIFO cost basis differing from ONE's
+    # weighted average, which is worth a cent or two. Once the dollar consequence
+    # is material that excuse no longer applies -- a 19-point gap is not a
+    # rounding convention -- so it escalates to something you must act on.
+    if (status == "MATCH_FIFO_AVG" and divergence is not None
+            and abs(divergence) >= float(tol.get("pnl_divergence_abs", 500))):
+        status = "COST_BASIS_DRIFT"
     return {"status": status, "label": label_from_bucket(ir),
             "ibkr_qty": ir["qty"], "ibkr_px": ir["avg_price"],
             "one_qty": orow["qty"], "one_px": orow["avg_price"],
@@ -683,8 +690,10 @@ def _compare(ir, orow, expiry_dist, tol):
 
 
 # ----------------------------------------------------------------- reporting
-ORDER = ["QTY_MISMATCH", "ONE_ONLY", "IBKR_ONLY", "PRICE_DRIFT", "MATCH_FIFO_AVG", "MATCH"]
-SYM = {"MATCH": "OK ", "MATCH_FIFO_AVG": "~px(FIFO)", "PRICE_DRIFT": "~px", "QTY_MISMATCH": "!QTY",
+ORDER = ["QTY_MISMATCH", "ONE_ONLY", "IBKR_ONLY", "PRICE_DRIFT",
+         "COST_BASIS_DRIFT", "MATCH_FIFO_AVG", "MATCH"]
+SYM = {"MATCH": "OK ", "MATCH_FIFO_AVG": "~px(FIFO)", "PRICE_DRIFT": "~px",
+       "COST_BASIS_DRIFT": "$px", "QTY_MISMATCH": "!QTY",
        "IBKR_ONLY": ">IB", "ONE_ONLY": ">ONE"}
 
 

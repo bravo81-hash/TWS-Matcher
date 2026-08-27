@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from datetime import date
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -61,6 +62,58 @@ def _num(x):
 def _chunks(seq, n):
     for i in range(0, len(seq), n):
         yield seq[i:i + n]
+
+
+# ------------------------------------------------------------------- theta
+# IB's modelGreeks theta cannot be trusted for these contracts. Checked against
+# Black-Scholes using IB's OWN spot, implied vol and tenor, on 13 live SPX legs:
+# delta and vega agree closely (0.4906 vs 0.4345; 12.89 vs 12.62), but theta is
+# 2-5x too large AND sign-inverted on calls (+4.36 where BS gives -1.29). The
+# arithmetic check is independent of the model: an ATM option holding V of time
+# value over T days decays at about V/(2T), which for that leg is 1.36/day, not
+# 6.26 -- IB's figure would consume the entire premium in 27 days.
+#
+# So delta, gamma and vega are taken from IB (they carry its rate and dividend
+# assumptions) and theta is recomputed locally from IB's own inputs. The
+# dominant decay term needs no rate or dividend assumption; the carry terms are
+# worth well under 0.5/day per contract and are governed by the two settings
+# below. IB's value is kept as theta_ib so the two can be compared.
+RISK_FREE_RATE = 0.04
+DIVIDEND_YIELD = 0.0
+
+
+def _norm_pdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+
+def _norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_theta_per_day(spot, strike, years, sigma, right,
+                     rate=RISK_FREE_RATE, div=DIVIDEND_YIELD):
+    """Black-Scholes theta per calendar day, per share. Negative = decay."""
+    if not (spot and strike and years and sigma) or years <= 0 or sigma <= 0:
+        return None
+    vt = sigma * math.sqrt(years)
+    d1 = (math.log(spot / strike) + (rate - div + 0.5 * sigma * sigma) * years) / vt
+    d2 = d1 - vt
+    dfq, dfr = math.exp(-div * years), math.exp(-rate * years)
+    decay = -spot * dfq * _norm_pdf(d1) * sigma / (2 * math.sqrt(years))
+    if right == "C":
+        annual = decay - rate * strike * dfr * _norm_cdf(d2)             + div * spot * dfq * _norm_cdf(d1)
+    else:
+        annual = decay + rate * strike * dfr * _norm_cdf(-d2)             - div * spot * dfq * _norm_cdf(-d1)
+    return annual / 365.0
+
+
+def _years_to_expiry(expiry, as_of=None):
+    try:
+        e = date(int(expiry[:4]), int(expiry[4:6]), int(expiry[6:8]))
+    except (TypeError, ValueError, IndexError):
+        return None
+    days = (e - (as_of or date.today())).days
+    return days / 365.0 if days > 0 else None
 
 
 # --------------------------------------------------------------- accounts
@@ -145,11 +198,16 @@ def collect_greeks(ib, positions) -> dict:
         for c, t in live:
             g = t.modelGreeks
             if g:
+                iv, spot = _num(g.impliedVol), _num(g.undPrice)
+                years = _years_to_expiry(c.lastTradeDateOrContractMonth)
+                local = bs_theta_per_day(spot, _num(c.strike), years, iv, c.right)
                 out[c.conId] = {
-                    "iv": _num(g.impliedVol), "delta": _num(g.delta),
+                    "iv": iv, "delta": _num(g.delta),
                     "gamma": _num(g.gamma), "vega": _num(g.vega),
-                    "theta": _num(g.theta), "opt_price": _num(g.optPrice),
-                    "und_price": _num(g.undPrice),
+                    "theta": local if local is not None else _num(g.theta),
+                    "theta_ib": _num(g.theta),
+                    "theta_source": "black-scholes" if local is not None else "ib",
+                    "opt_price": _num(g.optPrice), "und_price": spot,
                 }
             ib.cancelMktData(c)
     return out
@@ -219,6 +277,68 @@ def collect_iv_stats(ib, underlyings, trading_day: str | None = None,
         except OSError:
             pass
     return out
+
+
+# ------------------------------------------------- expiry & assignment radar
+# Cash-settled, European index options cannot be assigned early and never turn
+# into stock, so they are exempt from the assignment check (they still appear in
+# the expiry radar, where they settle for cash).
+CASH_SETTLED_ROOTS = {"SPX", "SPXW", "RUT", "RUTW", "NDX", "NDXP", "XSP",
+                      "VIX", "VIXW", "DJX", "MXEA", "MXEF"}
+
+# An in-the-money short American option is at risk of early exercise once its
+# remaining extrinsic value is small enough that the holder gives up little by
+# exercising. Below this many dollars per share, treat it as live risk.
+ASSIGNMENT_EXTRINSIC = 0.50
+
+
+def assess_expiry_risk(positions, greeks, within_days=7, as_of=None) -> dict:
+    """Positions near expiry, and short options exposed to early assignment.
+
+    Two different clocks. The expiry radar is about work that has to happen --
+    roll, close, or settle -- before a contract disappears. The assignment radar
+    is about something that can happen tonight without warning: an early
+    assignment turns a short option into stock, which is how an SMSF ends up
+    short shares it is not permitted to hold.
+    """
+    today = as_of or date.today()
+    expiring, assignment = [], []
+    for p in positions:
+        c = p.contract
+        if c.secType != "OPT" or not p.position:
+            continue
+        years = _years_to_expiry(c.lastTradeDateOrContractMonth, today)
+        dte = round(years * 365) if years else 0
+        g = greeks.get(c.conId) or {}
+        spot, strike = g.get("und_price"), _num(c.strike)
+        intrinsic = None
+        if spot and strike:
+            intrinsic = (max(0.0, spot - strike) if c.right == "C"
+                         else max(0.0, strike - spot))
+        px = g.get("opt_price")
+        extrinsic = (px - intrinsic) if (px is not None and intrinsic is not None) else None
+        row = {
+            "account": p.account, "underlying": c.symbol,
+            "tradingClass": c.tradingClass, "expiry": c.lastTradeDateOrContractMonth,
+            "expiry_label": _expiry_label(c.lastTradeDateOrContractMonth),
+            "strike": strike, "right": c.right, "qty": float(p.position),
+            "dte": dte, "spot": spot, "delta": g.get("delta"),
+            "intrinsic": intrinsic, "extrinsic": extrinsic,
+            "itm": bool(intrinsic and intrinsic > 0),
+            "cash_settled": (c.tradingClass or c.symbol) in CASH_SETTLED_ROOTS
+                            or c.symbol in CASH_SETTLED_ROOTS,
+        }
+        if dte <= within_days:
+            expiring.append(row)
+        if (p.position < 0 and not row["cash_settled"] and row["itm"]
+                and extrinsic is not None and extrinsic <= ASSIGNMENT_EXTRINSIC):
+            assignment.append(row)
+
+    expiring.sort(key=lambda r: (r["dte"], r["underlying"], r["strike"] or 0))
+    assignment.sort(key=lambda r: (r["extrinsic"] if r["extrinsic"] is not None
+                                   else 99, r["dte"]))
+    return {"expiring": expiring, "assignment_risk": assignment,
+            "within_days": within_days}
 
 
 # ---------------------------------------------------------------- rollups
@@ -327,5 +447,6 @@ def collect_all(ib, accounts=None) -> dict:
         "accounts": acct_values,
         "nav_total": nav,
         "iv": iv_stats,
+        "radar": assess_expiry_risk(positions, greeks),
         **aggregate_metrics(positions, pnl, greeks, iv_stats, nav=nav),
     }

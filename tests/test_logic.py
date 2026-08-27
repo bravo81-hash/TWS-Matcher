@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 import dashboard
 import email_report
 import flex_export
+import market_metrics
 import one_reader
 import recon_one_os
 import reconcile
@@ -107,6 +108,61 @@ class FlexExportHousekeepingTests(unittest.TestCase):
                 {"U1": {"status": flex_export.COMPLETE}}, out_dir=d)
             self.assertEqual(sorted(os.listdir(d)),
                              ["ONEImport_U1.csv", "notes.txt"])
+
+
+class ExpiryAndAssignmentRadarTests(unittest.TestCase):
+    @staticmethod
+    def contract(**kw):
+        base = {"secType": "OPT", "symbol": "MSFT", "tradingClass": "MSFT",
+                "lastTradeDateOrContractMonth": "20260821", "strike": 390.0,
+                "right": "C", "conId": 1, "multiplier": "100"}
+        base.update(kw)
+        return type("C", (), base)()
+
+    @staticmethod
+    def position(contract, qty, account="U1"):
+        return type("P", (), {"account": account, "contract": contract,
+                              "position": qty})()
+
+    def test_short_itm_option_with_no_extrinsic_is_assignment_risk(self):
+        """The MSFT early assignment, as it looked the day before it happened."""
+        c = self.contract()
+        greeks = {1: {"und_price": 481.5, "opt_price": 91.6, "delta": 0.99}}
+        r = market_metrics.assess_expiry_risk(
+            [self.position(c, -1.0)], greeks, as_of=date(2026, 8, 19))
+        [hit] = r["assignment_risk"]
+        self.assertEqual(hit["underlying"], "MSFT")
+        self.assertAlmostEqual(hit["extrinsic"], 0.10, 2)
+
+    def test_cash_settled_index_is_never_assignment_risk(self):
+        """SPX is European and cash settled: deep ITM, still cannot be assigned."""
+        c = self.contract(symbol="SPX", tradingClass="SPXW", strike=7000.0,
+                          right="P", conId=2)
+        greeks = {2: {"und_price": 6800.0, "opt_price": 201.0, "delta": -0.98}}
+        r = market_metrics.assess_expiry_risk(
+            [self.position(c, -4.0)], greeks, as_of=date(2026, 8, 19))
+        self.assertEqual(r["assignment_risk"], [])
+        self.assertTrue(r["expiring"][0]["cash_settled"])
+
+    def test_long_option_is_not_assignment_risk(self):
+        c = self.contract()
+        greeks = {1: {"und_price": 481.5, "opt_price": 91.6, "delta": 0.99}}
+        r = market_metrics.assess_expiry_risk(
+            [self.position(c, +1.0)], greeks, as_of=date(2026, 8, 19))
+        self.assertEqual(r["assignment_risk"], [])
+
+    def test_short_itm_option_still_holding_extrinsic_is_not_flagged(self):
+        c = self.contract()
+        greeks = {1: {"und_price": 481.5, "opt_price": 99.0, "delta": 0.80}}
+        r = market_metrics.assess_expiry_risk(
+            [self.position(c, -1.0)], greeks, as_of=date(2026, 8, 19))
+        self.assertEqual(r["assignment_risk"], [])
+
+    def test_theta_is_recomputed_because_ib_reports_it_wrong(self):
+        """IB gave +4.36/day on a near-ATM long call; decay must be negative."""
+        t = market_metrics.bs_theta_per_day(7720.4, 7800.0, 0.173, 0.1287, "C")
+        self.assertLess(t, 0)
+        self.assertLess(abs(t), 3)          # ~V/(2T), not IB's 4-6/day
 
 
 class ReconciliationTests(unittest.TestCase):
@@ -311,6 +367,32 @@ class ReconciliationTests(unittest.TestCase):
         self.assertAlmostEqual(summary["net"], f["pnl_divergence"], 2)
         self.assertAlmostEqual(summary["gross"], abs(f["pnl_divergence"]), 2)
         self.assertEqual(summary["by_account"]["U1"], f["pnl_divergence"])
+
+    def test_material_cost_basis_gap_escalates_out_of_the_fifo_excuse(self):
+        """A 19-point gap is not a FIFO rounding convention; it must be actionable."""
+        result = reconcile.reconcile_snapshots(
+            {"captured_at": "now", "fills_today": [], "legs": [
+                {**option(account="U1", qty=4.0), "avg_price": 60.0}]},
+            {"source_file": "r.csv", "positions": [
+                {**option(qty=4.0), "avg_price": 79.65}]},
+            config(),
+        )
+        [f] = result["accounts"]["U1"]
+        self.assertEqual(f["status"], "COST_BASIS_DRIFT")
+        self.assertTrue(reconcile.is_actionable_finding(f))
+        self.assertAlmostEqual(f["pnl_divergence"], (60.0 - 79.65) * 4 * 100, 2)
+
+    def test_small_cost_basis_gap_stays_a_fifo_note(self):
+        result = reconcile.reconcile_snapshots(
+            {"captured_at": "now", "fills_today": [], "legs": [
+                {**option(account="U1", qty=1.0), "avg_price": 10.30}]},
+            {"source_file": "r.csv", "positions": [
+                {**option(qty=1.0), "avg_price": 10.0}]},
+            config(),
+        )
+        [f] = result["accounts"]["U1"]
+        self.assertEqual(f["status"], "MATCH_FIFO_AVG")
+        self.assertFalse(reconcile.is_actionable_finding(f))
 
     def test_offsetting_divergences_net_out_but_gross_still_reports(self):
         """A small net can hide two large, opposite per-leg disagreements."""
