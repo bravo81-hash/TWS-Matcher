@@ -271,11 +271,11 @@ def _set(**kw):
 # --------------------------------------------------------------- rendering
 STATUS_COLORS = {
     "MATCH": "#1a7f37", "MATCH_FIFO_AVG": "#0969da", "PRICE_DRIFT": "#9a6700",
-    "COST_BASIS_DRIFT": "#bc4c00", "QTY_MISMATCH": "#cf222e",
+    "QTY_MISMATCH": "#cf222e",
     "IBKR_ONLY": "#0969da", "ONE_ONLY": "#8250df",
 }
 ORDER = ["QTY_MISMATCH", "ONE_ONLY", "IBKR_ONLY", "PRICE_DRIFT",
-         "COST_BASIS_DRIFT", "MATCH_FIFO_AVG", "MATCH"]
+         "MATCH_FIFO_AVG", "MATCH"]
 
 PAGE_STYLE = (
     "body{font:12.5px/1.35 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;"
@@ -1296,23 +1296,29 @@ def render_html() -> str:
                   f"<td class='l'><span class='tag' style='background:{color}'{tooltip}>"
                   f"{tag_label}</span></td></tr>")
             p("</table></div>")
-            drifts = [f for f in flags if f["status"] == "COST_BASIS_DRIFT"]
-            if drifts:
-                p("<div class='muted' style='margin-top:6px'>COST_BASIS_DRIFT: "
-                  "quantity agrees but ONE's entry price does not. Set ONE's "
-                  "price to the IBKR price above; the P&amp;L impact column is "
-                  "what the trade's reported profit is wrong by until you "
-                  "do.</div>")
+
         if basis_info:
+            basis_info.sort(key=lambda f: -abs(f.get("pnl_divergence") or 0))
             p(f"<details class='muted' style='margin-top:6px'><summary>"
               f"{len(basis_info)} quantity-matched cost-basis difference(s) "
-              "(IBKR FIFO versus ONE weighted average)</summary>"
+              "(IBKR FIFO versus ONE moving average)</summary>"
+              "<div class='muted' style='margin:4px 0'>Both are correct. IBKR "
+              "relieves closed lots first in, first out; ONE carries a moving "
+              "average, so any leg scaled into and partially closed without "
+              "going flat must differ. Lifetime P&amp;L is the same either way "
+              "&mdash; only the split between realised and unrealised moves, and "
+              "ONE books the offset on the part already closed. Nothing to fix."
+              "</div>"
               "<div class='table-wrap'><table><tr><th class='l'>instrument</th>"
-              "<th>IBKR px</th><th>ONE px</th></tr>")
+              "<th>IBKR px (FIFO)</th><th>ONE px (avg)</th><th>px delta</th>"
+              "<th>reporting difference</th></tr>")
             for f in basis_info:
+                d = f.get("pnl_divergence")
                 p(f"<tr><td class='l mono'>{html.escape(f['label'])}</td>"
                   f"<td class='mono'>{f['ibkr_px']:.4f}</td>"
-                  f"<td class='mono'>{f['one_px']:.4f}</td></tr>")
+                  f"<td class='mono'>{f['one_px']:.4f}</td>"
+                  f"<td class='mono'>{(f.get('px_delta') or 0):+.4f}</td>"
+                  f"<td class='mono'>{'' if d is None else f'{d:+,.0f}'}</td></tr>")
             p("</table></div></details>")
         if expected:
             p(f"<details class='muted' style='margin-top:6px'><summary>"
@@ -1822,7 +1828,7 @@ def render_risk_html() -> str:
     div = (st.get("result") or {}).get("pnl_divergence") or {}
     exp = radar.get("expiring") or []
     n_div = sum(1 for r in div.get("worst") or []
-                if r.get("status") in ("COST_BASIS_DRIFT", "PRICE_DRIFT"))
+                if r.get("status") == "PRICE_DRIFT")
 
     # ---- tabs
     p("<div data-tabgroup='risk'><div class='tabnav'>")
@@ -2142,20 +2148,22 @@ def render_risk_html() -> str:
     # ================= COST BASIS =================
     p("<div class='tabpanel' data-tab='risk-basis'>")
     if div.get("worst"):
-        p("<div class='card'><h3>Cost-basis P&amp;L divergence &mdash; ONE vs "
-          "IBKR</h3>")
+        p("<div class='card'><h3>Cost-basis convention &mdash; ONE moving "
+          "average vs IBKR FIFO</h3>")
         p(f"<div class='sub'>Net <b>{_m(div.get('net'), '+,.0f')}</b> "
           f"&nbsp;|&nbsp; gross <b>{_m(div.get('gross'))}</b></div>")
-        p("<div class='muted' style='margin-bottom:6px'>ONE reports no P&amp;L "
-          "for an open leg, so this prices the consequence instead: when these "
-          "positions close, ONE will report this many dollars more profit than "
-          "IBKR purely because the two cost bases disagree. Gross matters more "
-          "than net &mdash; offsetting legs can hide a large disagreement inside "
-          "a small net.</div>")
+        p("<div class='muted' style='margin-bottom:6px'>Not an error and not "
+          "money at risk. IBKR relieves closed lots first in, first out; ONE "
+          "carries a moving average cost. On a leg scaled into and partially "
+          "closed without ever going flat, the two must differ, and this is by "
+          "how much. Lifetime P&amp;L is identical &mdash; only the split "
+          "between realised and unrealised moves. Useful for knowing why ONE's "
+          "per-leg P&amp;L will not tie to IBKR's while the position is open; "
+          "nothing here needs fixing in either system.</div>")
         p("<div class='table-wrap'><table class='sortable'><thead><tr>"
           "<th class='l sortable'>account</th><th class='l sortable'>instrument</th>"
           "<th class='l sortable'>status</th><th class='sortable'>px delta</th>"
-          "<th class='sortable'>P&amp;L divergence</th></tr></thead><tbody>")
+          "<th class='sortable'>reporting difference</th></tr></thead><tbody>")
         for r in div["worst"]:
             colour = STATUS_COLORS.get(r.get("status"), "#8b949e")
             p(f"<tr><td class='l'>{html.escape(str(r['account']))}</td>"

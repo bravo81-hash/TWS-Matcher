@@ -368,19 +368,56 @@ class ReconciliationTests(unittest.TestCase):
         self.assertAlmostEqual(summary["gross"], abs(f["pnl_divergence"]), 2)
         self.assertEqual(summary["by_account"]["U1"], f["pnl_divergence"])
 
-    def test_material_cost_basis_gap_escalates_out_of_the_fifo_excuse(self):
-        """A 19-point gap is not a FIFO rounding convention; it must be actionable."""
+    def test_large_cost_basis_gap_is_still_only_a_lot_convention(self):
+        """Regression: a big gap here is a long scaling history, not an error.
+
+        Rebuilt from the real fills behind RUT 260919P2950 (ONE trade 142), where
+        the leg was scaled into over three weeks and partially closed without ever
+        going flat.  ONE's moving average lands on 46.04667 and IBKR's FIFO on
+        26.3958 -- both arithmetically exact.  An earlier version escalated this
+        to an actionable flag and told the user to retype ONE's price, which would
+        have corrupted a correct book.
+        """
         result = reconcile.reconcile_snapshots(
             {"captured_at": "now", "fills_today": [], "legs": [
-                {**option(account="U1", qty=4.0), "avg_price": 60.0}]},
+                {**option(account="U1", qty=4.0), "avg_price": 26.3958}]},
             {"source_file": "r.csv", "positions": [
-                {**option(qty=4.0), "avg_price": 79.65}]},
+                {**option(qty=4.0), "avg_price": 46.04667}]},
             config(),
         )
         [f] = result["accounts"]["U1"]
-        self.assertEqual(f["status"], "COST_BASIS_DRIFT")
-        self.assertTrue(reconcile.is_actionable_finding(f))
-        self.assertAlmostEqual(f["pnl_divergence"], (60.0 - 79.65) * 4 * 100, 2)
+        self.assertEqual(f["status"], "MATCH_FIFO_AVG")
+        self.assertFalse(reconcile.is_actionable_finding(f))
+        # the dollars are still reported, as a reporting difference
+        self.assertAlmostEqual(f["pnl_divergence"],
+                               (26.3958 - 46.04667) * 4 * 100, delta=0.05)
+
+    def test_moving_average_and_fifo_reproduce_both_reported_prices(self):
+        """The two conventions, run over one real fill sequence, land where the
+        two systems say they land -- which is why neither needs correcting."""
+        fills = [(+2, 68.61, 2.70), (+2, 54.85, 2.70), (-2, 76.90, 2.70),
+                 (+1, 39.51, 1.00), (+1, 39.51, 1.70), (+2, 27.43, 2.70)]
+        qty = cost = 0.0
+        for q, px, _c in fills:                      # ONE: moving average
+            if qty == 0 or (qty > 0) == (q > 0):
+                cost = (cost * abs(qty) + px * abs(q)) / (abs(qty) + abs(q))
+            qty += q
+        self.assertAlmostEqual(cost, 42.89, 5)       # ONE reports 42.89
+
+        lots = []                                    # IBKR: FIFO incl commission
+        for q, px, c in fills:
+            unit = px + (c / abs(q) / 100.0) * (1 if q > 0 else -1)
+            while lots and (lots[0][0] > 0) != (q > 0) and q:
+                take = min(abs(lots[0][0]), abs(q))
+                lots[0][0] -= take * (1 if lots[0][0] > 0 else -1)
+                q -= take * (1 if q > 0 else -1)
+                if lots[0][0] == 0:
+                    lots.pop(0)
+            if q:
+                lots.append([q, unit])
+        held = sum(l[0] for l in lots)
+        self.assertEqual(held, 6)
+        self.assertAlmostEqual(sum(l[0] * l[1] for l in lots) / held, 40.6102, 4)
 
     def test_small_cost_basis_gap_stays_a_fifo_note(self):
         result = reconcile.reconcile_snapshots(
@@ -639,10 +676,10 @@ class DashboardAdjustmentTests(unittest.TestCase):
         self.assertNotIn("background:#3a2d0a", page)
 
 
-    def test_cost_basis_drift_row_carries_the_price_and_the_dollars(self):
+    def test_price_flag_row_carries_the_price_and_the_dollars(self):
         """A price flag the user cannot price is a flag they cannot act on."""
         finding = {
-            "status": "COST_BASIS_DRIFT", "label": "RUT 2026-09-17 2950P",
+            "status": "PRICE_DRIFT", "label": "RUT 2026-09-17 2950P",
             "ibkr_qty": 4.0, "ibkr_px": 26.3958, "one_qty": 4.0,
             "one_px": 46.0467, "px_delta": -19.6509,
             "pnl_divergence": -7860.36, "underlying": "RUT",
@@ -668,7 +705,7 @@ class DashboardAdjustmentTests(unittest.TestCase):
         self.assertIn("46.05", page)      # ONE's price, so the user knows what to change
         self.assertIn("-19.65", page)     # how far apart they are
         self.assertIn("-7,860", page)     # what it is worth
-        self.assertIn("Set ONE&#x27;s", page.replace("'", "&#x27;"))
+        self.assertIn("PRICE_DRIFT", page)
 
 class FlexImportCompletenessTests(unittest.TestCase):
     @staticmethod
@@ -839,7 +876,7 @@ class RiskChartTests(unittest.TestCase):
             dashboard._state["result"] = {"pnl_divergence": {
                 "net": -7397.25, "gross": 11350.59, "by_ticker": {"RUT": -6543.88},
                 "worst": [{"account": "U4557912", "label": "RUT 2026-09-17 2950P",
-                           "status": "COST_BASIS_DRIFT", "px_delta": -19.6509,
+                           "status": "MATCH_FIFO_AVG", "px_delta": -19.6509,
                            "pnl_divergence": -7860.36}]}}
         try:
             page = dashboard.render_risk_html()

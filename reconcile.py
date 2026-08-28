@@ -85,11 +85,13 @@ def resolve_one_account(account, account_map):
 
 
 def summarise_pnl_divergence(by_account: dict) -> dict:
-    """Total dollars by which ONE's cost basis will misreport P&L vs IBKR.
+    """Total dollars separating ONE's moving-average cost from IBKR's FIFO.
 
-    Rolled up per account and per underlying. ``gross`` sums the absolute
-    divergences: offsetting legs can hide a large per-leg disagreement inside a
-    small net, and the gross figure is what says how much is actually adrift.
+    Rolled up per account and per underlying. This measures a difference in lot
+    convention, not an error in either system: it says how far ONE's reported
+    per-leg P&L will sit from IBKR's while the position is open. ``gross`` sums
+    the absolute differences, since offsetting legs hide the size of the effect
+    inside a small net.
     """
     total = gross = 0.0
     per_account: dict = defaultdict(float)
@@ -665,20 +667,22 @@ def _compare(ir, orow, expiry_dist, tol):
             else "MATCH_FIFO_AVG"
     else:
         status = "MATCH"
-    # ONE's report carries no P&L for an OPEN leg, so unrealised P&L cannot be
-    # diffed directly. What can be priced exactly is the consequence of the two
-    # cost bases disagreeing: when the position is closed, ONE will report this
-    # many dollars more profit than IBKR. Positive = ONE flatters the result.
+    # How far apart the two cost bases place this leg, in dollars. This is a
+    # REPORTING difference, not an error and not money at risk: ONE carries a
+    # moving average cost while IBKR relieves lots FIFO, so on any leg that was
+    # scaled into and partially closed without going flat, the two must differ.
+    # Lifetime P&L is identical under both; only the split between realised and
+    # unrealised moves, and ONE books the offsetting amount on the closed part.
+    #
+    # Verified against the ONE trade log (2026-08-29). Rebuilding SPX 260919P7575
+    # from its six fills gives moving average 42.89000 (ONE reports 42.89000) and
+    # FIFO-with-commission 40.61017 (IBKR reports 40.61020); RUTW 260831P3000
+    # gives 22.80625 / 16.99630 against ONE 22.80625 and IBKR 16.99630. Both
+    # systems are exactly right. Do NOT escalate a large gap here into an
+    # actionable flag -- a big number means a long scaling history, not an error.
     mult = float(ir.get("multiplier") or orow.get("multiplier") or 100)
     divergence = ((ir["avg_price"] - orow["avg_price"]) * orow["qty"] * mult
                   if qty_ok else None)
-    # MATCH_FIFO_AVG exists to excuse IBKR's FIFO cost basis differing from ONE's
-    # weighted average, which is worth a cent or two. Once the dollar consequence
-    # is material that excuse no longer applies -- a 19-point gap is not a
-    # rounding convention -- so it escalates to something you must act on.
-    if (status == "MATCH_FIFO_AVG" and divergence is not None
-            and abs(divergence) >= float(tol.get("pnl_divergence_abs", 500))):
-        status = "COST_BASIS_DRIFT"
     return {"status": status, "label": label_from_bucket(ir),
             "ibkr_qty": ir["qty"], "ibkr_px": ir["avg_price"],
             "one_qty": orow["qty"], "one_px": orow["avg_price"],
@@ -691,10 +695,9 @@ def _compare(ir, orow, expiry_dist, tol):
 
 # ----------------------------------------------------------------- reporting
 ORDER = ["QTY_MISMATCH", "ONE_ONLY", "IBKR_ONLY", "PRICE_DRIFT",
-         "COST_BASIS_DRIFT", "MATCH_FIFO_AVG", "MATCH"]
+         "MATCH_FIFO_AVG", "MATCH"]
 SYM = {"MATCH": "OK ", "MATCH_FIFO_AVG": "~px(FIFO)", "PRICE_DRIFT": "~px",
-       "COST_BASIS_DRIFT": "$px", "QTY_MISMATCH": "!QTY",
-       "IBKR_ONLY": ">IB", "ONE_ONLY": ">ONE"}
+       "QTY_MISMATCH": "!QTY", "IBKR_ONLY": ">IB", "ONE_ONLY": ">ONE"}
 
 
 def print_report(by_account, unmapped, ignore, accounts):
