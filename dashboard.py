@@ -318,6 +318,21 @@ PAGE_STYLE = (
     "th.sortable:hover{color:#e6edf3}"
     "th.sortable::after{content:'\\2195';opacity:0.35;margin-left:4px}"
     "th.sortable.sorted::after{opacity:1}"
+    ".kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin:8px 0 12px}"
+    ".kpi{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:7px 10px}"
+    ".kpi-l{color:#8b949e;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em}"
+    ".kpi-v{font-size:19px;margin:2px 0 1px;font-variant-numeric:tabular-nums}"
+    ".kpi-n{color:#8b949e;font-size:10.5px}"
+    ".card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:9px 11px;margin:0 0 10px;box-sizing:border-box;min-width:0}"
+    ".card h3{font-size:12.5px;margin:0 0 3px;font-weight:600}"
+    ".chartgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:10px}"
+    ".chart{display:block;max-width:100%;height:auto;overflow:visible}"
+    ".chart rect:hover{opacity:1}"
+    ".meter{display:inline-block;width:100%;min-width:60px;height:7px;background:#21262d;border-radius:4px;overflow:hidden;vertical-align:middle}"
+    ".meter-fill{display:block;height:100%;border-radius:4px}"
+    ".dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:middle}"
+    "tfoot td{border-top:1px solid #30363d;border-bottom:none}"
+    "@media(max-width:768px){.chartgrid{grid-template-columns:1fr}}"
     ".grid-accts{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:10px;margin:6px 0}"
     ".grid-accts > .acct{margin:0;min-width:0;overflow-x:auto}"
     "@media(max-width:768px){.grid-accts{grid-template-columns:1fr}.wrap{width:100%;padding:4px 6px}}"
@@ -1255,21 +1270,39 @@ def render_html() -> str:
         else:
             p("<div class='table-wrap'><table>"
               "<tr><th class='l'>instrument</th><th>IBKR qty</th>"
-              "<th>IBKR px</th><th>ONE qty</th>"
+              "<th>IBKR px</th><th>ONE qty</th><th>ONE px</th>"
+              "<th>px delta</th><th>P&amp;L impact</th>"
               "<th class='l'>flag</th></tr>")
             for f in flags:
                 iq = "" if f["ibkr_qty"] is None else f"{f['ibkr_qty']:+.0f}"
                 oq = "" if f["one_qty"] is None else f"{f['one_qty']:+.0f}"
                 ip = "" if f["ibkr_px"] is None else f"{f['ibkr_px']:.2f}"
+                op = "" if f.get("one_px") is None else f"{f['one_px']:.2f}"
+                dx = ("" if f.get("px_delta") is None
+                      else f"{f['px_delta']:+.2f}")
+                # A price flag the user cannot price is a flag they cannot act
+                # on, so carry ONE's price and the dollars through to the table.
+                pl = f.get("pnl_divergence")
+                plc = ("" if pl is None else
+                       f"<b style='color:{'#ff7b72' if pl < 0 else '#3fb950'}'>"
+                       f"{pl:+,.0f}</b>")
                 color = STATUS_COLORS.get(f["status"], "#8b949e")
                 tag_label = "MATCH (FIFO)" if f["status"] == "MATCH_FIFO_AVG" else f["status"]
                 tooltip = " title='Quantity matched. IBKR uses FIFO cost basis while ONE uses Weighted Avg entry.'" if f["status"] == "MATCH_FIFO_AVG" else ""
                 p(f"<tr><td class='l mono'>{html.escape(f['label'])}</td>"
                   f"<td class='mono'>{iq}</td><td class='mono'>{ip}</td>"
-                  f"<td class='mono'>{oq}</td>"
+                  f"<td class='mono'>{oq}</td><td class='mono'>{op}</td>"
+                  f"<td class='mono'>{dx}</td><td class='mono'>{plc}</td>"
                   f"<td class='l'><span class='tag' style='background:{color}'{tooltip}>"
                   f"{tag_label}</span></td></tr>")
             p("</table></div>")
+            drifts = [f for f in flags if f["status"] == "COST_BASIS_DRIFT"]
+            if drifts:
+                p("<div class='muted' style='margin-top:6px'>COST_BASIS_DRIFT: "
+                  "quantity agrees but ONE's entry price does not. Set ONE's "
+                  "price to the IBKR price above; the P&amp;L impact column is "
+                  "what the trade's reported profit is wrong by until you "
+                  "do.</div>")
         if basis_info:
             p(f"<details class='muted' style='margin-top:6px'><summary>"
               f"{len(basis_info)} quantity-matched cost-basis difference(s) "
@@ -1557,6 +1590,11 @@ def _m(v, spec=",.0f", dash="&mdash;", suffix=""):
     return txt
 
 
+def _sv(v):
+    """data-sort-value on a cell so the column header sorts numerically, not as text."""
+    return "" if v is None else f" data-sort-value='{v}'"
+
+
 def _headroom_cell(pct):
     """Liquidity headroom, coloured by how close a margin call is."""
     if pct is None:
@@ -1573,54 +1611,192 @@ def _iv_cell(rank):
     return f"<b style='color:{colour}'>{rank:.0f}</b>"
 
 
+# --------------------------------------------------------------------------
+# Small inline-SVG charts.  Everything is self-contained: this dashboard is
+# served from a local socket with no internet, so no charting library exists
+# to lean on and none is wanted.
+# --------------------------------------------------------------------------
+
+C_POS, C_NEG, C_AXIS, C_GRID, C_TEXT = "#3fb950", "#ff7b72", "#8b949e", "#21262d", "#e6edf3"
+TICKER_COLOURS = ["#58a6ff", "#bc8cff", "#f2cc60", "#3fb950", "#ff7b72",
+                  "#79c0ff", "#ffa657", "#7ee787"]
+
+
+def _colour_for(key, order):
+    """Stable colour per ticker so a ticker keeps its colour across every chart."""
+    try:
+        return TICKER_COLOURS[order.index(key) % len(TICKER_COLOURS)]
+    except ValueError:
+        return "#58a6ff"
+
+
+def _diverging_bars(rows, width=520, row_h=24, pad_left=110, fmt="{:+,.0f}",
+                    empty="no data"):
+    """Horizontal bars either side of a zero line.
+
+    rows: (label, value, tooltip, colour).  Zero always sits at the centre so
+    long and short read as mirror images, which is the point for a book that is
+    meant to be delta neutral.
+    """
+    rows = [r for r in rows if r[1] is not None]
+    if not rows:
+        return f"<div class='muted' style='padding:6px'>{empty}</div>"
+    span = max(abs(r[1]) for r in rows) or 1.0
+    pad_right = 76
+    plot = max(width - pad_left - pad_right, 60)
+    mid = pad_left + plot / 2.0
+    height = len(rows) * row_h + 14
+    s = [f"<svg class='chart' viewBox='0 0 {width} {height}' width='100%' "
+         f"height='{height}' preserveAspectRatio='xMidYMid meet' role='img'>"]
+    s.append(f"<line x1='{mid:.1f}' y1='2' x2='{mid:.1f}' y2='{height - 12:.1f}' "
+             f"stroke='{C_AXIS}' stroke-width='1' opacity='0.5'/>")
+    for i, (label, value, tip, colour) in enumerate(rows):
+        y = i * row_h + 4
+        w = abs(value) / span * (plot / 2.0)
+        x = mid if value >= 0 else mid - w
+        col = colour or (C_POS if value >= 0 else C_NEG)
+        s.append(
+            f"<rect x='{x:.1f}' y='{y:.1f}' width='{max(w, 1.0):.1f}' "
+            f"height='{row_h - 8}' rx='2' fill='{col}' opacity='0.85'>"
+            f"<title>{html.escape(str(tip))}</title></rect>")
+        s.append(f"<text x='{pad_left - 6}' y='{y + row_h - 11:.1f}' "
+                 f"text-anchor='end' font-size='11' fill='{C_TEXT}'>"
+                 f"{html.escape(str(label))}</text>")
+        vx = mid + w + 6 if value >= 0 else mid - w - 6
+        anchor = "start" if value >= 0 else "end"
+        s.append(f"<text x='{vx:.1f}' y='{y + row_h - 11:.1f}' text-anchor='{anchor}' "
+                 f"font-size='10.5' fill='{C_AXIS}' "
+                 f"font-variant-numeric='tabular-nums'>{fmt.format(value)}</text>")
+    s.append("</svg>")
+    return "".join(s)
+
+
+def _line_chart(points, width=760, height=200, fmt="{:,.0f}", empty=""):
+    """Line + area chart of (label, value) pairs, with min/max/last annotated."""
+    points = [(str(a), b) for a, b in points if b is not None]
+    if len(points) < 2:
+        return f"<div class='muted' style='padding:6px'>{empty}</div>"
+    vals = [v for _, v in points]
+    lo, hi = min(vals), max(vals)
+    if hi == lo:
+        hi, lo = hi + 1, lo - 1
+    pad_l, pad_r, pad_t, pad_b = 62, 12, 12, 22
+    pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
+    n = len(points)
+
+    def xy(i, v):
+        x = pad_l + (pw * i / (n - 1))
+        y = pad_t + ph - (ph * (v - lo) / (hi - lo))
+        return x, y
+
+    pts = [xy(i, v) for i, (_, v) in enumerate(points)]
+    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+    area = (f"{pad_l:.1f},{pad_t + ph:.1f} " + line +
+            f" {pad_l + pw:.1f},{pad_t + ph:.1f}")
+    rising = vals[-1] >= vals[0]
+    colour = C_POS if rising else C_NEG
+    s = [f"<svg class='chart' viewBox='0 0 {width} {height}' width='100%' "
+         f"height='{height}' preserveAspectRatio='xMidYMid meet' role='img'>"]
+    for frac in (0.0, 0.5, 1.0):
+        y = pad_t + ph * frac
+        val = hi - (hi - lo) * frac
+        s.append(f"<line x1='{pad_l}' y1='{y:.1f}' x2='{pad_l + pw}' y2='{y:.1f}' "
+                 f"stroke='{C_GRID}' stroke-width='1'/>")
+        s.append(f"<text x='{pad_l - 6}' y='{y + 3.5:.1f}' text-anchor='end' "
+                 f"font-size='10' fill='{C_AXIS}' "
+                 f"font-variant-numeric='tabular-nums'>{fmt.format(val)}</text>")
+    s.append(f"<polygon points='{area}' fill='{colour}' opacity='0.10'/>")
+    s.append(f"<polyline points='{line}' fill='none' stroke='{colour}' "
+             f"stroke-width='2' stroke-linejoin='round'/>")
+    for (x, y), (label, v) in zip(pts, points):
+        s.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='2.8' fill='{colour}'>"
+                 f"<title>{html.escape(label)}: {fmt.format(v)}</title></circle>")
+    s.append(f"<text x='{pad_l}' y='{height - 6}' font-size='10' fill='{C_AXIS}'>"
+             f"{html.escape(points[0][0])}</text>")
+    s.append(f"<text x='{pad_l + pw}' y='{height - 6}' text-anchor='end' "
+             f"font-size='10' fill='{C_AXIS}'>{html.escape(points[-1][0])}</text>")
+    s.append("</svg>")
+    return "".join(s)
+
+
+def _meter(value, lo=0, hi=100, colour="#58a6ff", label=""):
+    """A thin 0-100 gauge, used for IV rank and margin utilisation."""
+    if value is None:
+        return "<span class='muted'>&mdash;</span>"
+    frac = max(0.0, min(1.0, (value - lo) / (hi - lo) if hi > lo else 0))
+    return (f"<span class='meter' title='{html.escape(str(label))}'>"
+            f"<span class='meter-fill' style='width:{frac * 100:.0f}%;"
+            f"background:{colour}'></span></span>")
+
+
+def _kpi(label, value_html, note=""):
+    return (f"<div class='kpi'><div class='kpi-l'>{label}</div>"
+            f"<div class='kpi-v'>{value_html}</div>"
+            f"<div class='kpi-n'>{note}</div></div>")
+
+
 def render_risk_html() -> str:
     with _lock:
         st = dict(_state)
     m = st.get("metrics")
     out = []
     p = out.append
-    p(_page_head("Risk & Greeks &mdash; TWS Matcher", refresh_secs=60))
+    p(_page_head("Risk &amp; Greeks &mdash; TWS Matcher", refresh_secs=60))
     p(nav_html("risk"))
-    p("<h1>Risk &amp; Greeks</h1>")
 
     if st.get("metrics_error"):
         p(f"<div class='acct' style='border-color:#cf222e'><b class='warn'>"
           f"Metrics error:</b> {html.escape(str(st['metrics_error']))}</div>")
     if not m:
+        p("<h1>Risk &amp; Greeks</h1>")
         p("<p class='muted'>Waiting for the first Greeks collection "
           "(runs every 5 minutes; it needs option market data)&hellip;</p>")
-        return "".join(out) + "</body></html>"
+        return "".join(out) + "</div></body></html>"
 
-    p(f"<div class='sub'>collected {html.escape(str(st.get('metrics_at')))} UTC "
-      f"&nbsp;|&nbsp; refreshed every {METRICS_INTERVAL // 60} min</div>")
-
-    # ---- accounts / margin
-    p("<h2>Accounts &amp; margin</h2>")
-    p("<table><tr><th>account</th><th>NAV</th><th>cash</th>"
-      "<th>gross position</th><th>init margin</th><th>maint margin</th>"
-      "<th>excess liquidity</th><th>headroom</th><th>init util</th></tr>")
-    for acct, d in sorted((m.get("accounts") or {}).items()):
-        cur = d.get("currency") or ""
-        p(f"<tr><td><b>{html.escape(acct)}</b></td>"
-          f"<td>{_m(d.get('NetLiquidation'))} {cur}</td>"
-          f"<td>{_m(d.get('TotalCashValue'))}</td>"
-          f"<td>{_m(d.get('GrossPositionValue'))}</td>"
-          f"<td>{_m(d.get('FullInitMarginReq'))}</td>"
-          f"<td>{_m(d.get('FullMaintMarginReq'))}</td>"
-          f"<td>{_m(d.get('ExcessLiquidity'))}</td>"
-          f"<td>{_headroom_cell(d.get('headroom_pct'))}</td>"
-          f"<td>{_m(d.get('init_margin_util_pct'), '.0f', suffix='%')}</td></tr>")
-    p("</table>")
-    p("<div class='muted'>Headroom is excess liquidity over net liquidation: "
-      "how far the account can fall before a margin call. Amber under 40%, "
-      "red under 20%.</div>")
-
-    # ---- assignment risk first: it is the only thing here that can happen tonight
+    tick = m.get("by_ticker") or []
+    expiries = m.get("by_expiry") or []
+    accounts = m.get("accounts") or {}
     radar = m.get("radar") or {}
     risk = radar.get("assignment_risk") or []
+    order = [t["underlying"] for t in
+             sorted(tick, key=lambda t: -abs(t.get("delta_dollars") or 0))]
+
+    book_theta = sum(t.get("theta") or 0 for t in tick)
+    book_vega = sum(t.get("vega") or 0 for t in tick)
+    book_delta = sum(t.get("delta_dollars") or 0 for t in tick)
+    book_daily = sum(t.get("daily_pnl") or 0 for t in tick)
+    book_unreal = sum(t.get("unrealized_pnl") or 0 for t in tick)
+    nav = m.get("nav_total") or 0
+    worst_headroom = min((d.get("headroom_pct") for d in accounts.values()
+                          if d.get("headroom_pct") is not None), default=None)
+
+    p("<h1>Risk &amp; Greeks</h1>")
+    p(f"<div class='sub'>collected {html.escape(str(st.get('metrics_at')))} UTC "
+      f"&nbsp;|&nbsp; refreshed every {METRICS_INTERVAL // 60} min "
+      f"&nbsp;|&nbsp; {sum(t.get('positions') or 0 for t in tick)} legs "
+      f"across {len(accounts)} account(s)</div>")
+
+    # ---- KPI strip: the six numbers worth knowing before anything else
+    p("<div class='kpis'>")
+    p(_kpi("Net liquidation", f"<b>{_m(nav)}</b>",
+           f"{len(accounts)} account(s), AUD"))
+    p(_kpi("Day P&amp;L", f"<b>{_m(book_daily, '+,.0f')}</b>",
+           f"{_m(book_daily / nav * 100 if nav else None, '+.2f', suffix='% of NAV')}"))
+    p(_kpi("Theta / day", f"<b>{_m(book_theta, '+,.0f')}</b>",
+           "positive = time decay pays you"))
+    p(_kpi("Net delta $", f"<b>{_m(book_delta, '+,.0f')}</b>",
+           f"notional; {_m(book_delta / 100.0, '+,.0f')} per 1% move"))
+    p(_kpi("Vega", f"<b>{_m(book_vega, '+,.0f')}</b>",
+           "P&amp;L per 1 vol point"))
+    p(_kpi("Tightest headroom", _headroom_cell(worst_headroom),
+           "excess liquidity over NAV"))
+    p("</div>")
+
+    # ---- assignment risk sits above the tabs: it can happen tonight and must
+    #      never be hidden behind a tab the user did not click.
     if risk:
         p("<div class='acct' style='border:2px solid #cf222e;background:#2d1416;"
-          "margin-bottom:14px'>"
+          "margin-bottom:12px'>"
           f"<h2 style='color:#ff7b72;margin:0 0 4px'>&#9888; {len(risk)} SHORT "
           f"OPTION{'S' if len(risk) > 1 else ''} AT EARLY-ASSIGNMENT RISK</h2>"
           "<div class='muted'>In the money with almost no extrinsic value left, "
@@ -1628,11 +1804,12 @@ def render_risk_html() -> str:
           "into stock overnight, without any execution reaching this tool. "
           "Index options are excluded &mdash; they are cash settled and cannot "
           "be assigned early.</div>")
-        p("<table><tr><th>account</th><th>contract</th><th>qty</th><th>DTE</th>"
+        p("<div class='table-wrap'><table><tr><th class='l'>account</th>"
+          "<th class='l'>contract</th><th>qty</th><th>DTE</th>"
           "<th>spot</th><th>intrinsic</th><th>extrinsic</th><th>delta</th></tr>")
         for r in risk:
-            p(f"<tr><td>{html.escape(str(r['account']))}</td>"
-              f"<td><b>{html.escape(str(r['underlying']))} "
+            p(f"<tr><td class='l'>{html.escape(str(r['account']))}</td>"
+              f"<td class='l'><b>{html.escape(str(r['underlying']))} "
               f"{html.escape(str(r['expiry_label']))} "
               f"{r['strike']:g}{r['right']}</b></td>"
               f"<td>{r['qty']:+.0f}</td><td>{r['dte']}</td>"
@@ -1640,57 +1817,72 @@ def render_risk_html() -> str:
               f"<td>{_m(r.get('intrinsic'), ',.2f')}</td>"
               f"<td><b style='color:#ff7b72'>{_m(r.get('extrinsic'), ',.2f')}</b></td>"
               f"<td>{_m(r.get('delta'), '.3f')}</td></tr>")
-        p("</table></div>")
+        p("</table></div></div>")
 
-    # ---- expiries needing attention
-    exp = radar.get("expiring") or []
-    if exp:
-        itm = [r for r in exp if r["itm"]]
-        p(f"<h2>Expiring within {radar.get('within_days', 7)} days</h2>")
-        p(f"<div class='muted'>{len(exp)} leg(s), {len(itm)} in the money. "
-          "In-the-money legs settle for cash or become stock; either way ONE "
-          "will not book it for you.</div>")
-        p("<table><tr><th>account</th><th>contract</th><th>qty</th><th>DTE</th>"
-          "<th>spot</th><th>moneyness</th><th>delta</th><th>settles</th></tr>")
-        for r in exp:
-            tag = ("<b style='color:#f2cc60'>ITM</b>" if r["itm"]
-                   else "<span class='muted'>OTM</span>")
-            p(f"<tr><td>{html.escape(str(r['account']))}</td>"
-              f"<td>{html.escape(str(r['underlying']))} "
-              f"{html.escape(str(r['expiry_label']))} "
-              f"{r['strike']:g}{r['right']}</td>"
-              f"<td>{r['qty']:+.0f}</td><td>{r['dte']}</td>"
-              f"<td>{_m(r.get('spot'), ',.2f')}</td><td>{tag}</td>"
-              f"<td>{_m(r.get('delta'), '.3f')}</td>"
-              f"<td>{'cash' if r['cash_settled'] else 'shares'}</td></tr>")
-        p("</table>")
-
-    # ---- cost-basis P&L divergence (from the reconciliation, not market data)
     div = (st.get("result") or {}).get("pnl_divergence") or {}
-    if div.get("worst"):
-        p("<h2>Cost-basis P&amp;L divergence &mdash; ONE vs IBKR</h2>")
-        p(f"<div class='sub'>Net <b>{_m(div.get('net'), '+,.0f')}</b> &nbsp;|&nbsp; "
-          f"gross <b>{_m(div.get('gross'))}</b> across "
-          f"{len(div.get('worst', []))}+ legs</div>")
-        p("<div class='muted'>ONE reports no P&amp;L for an open leg, so this "
-          "prices the consequence instead: when these positions close, ONE will "
-          "report this many dollars more profit than IBKR purely because the two "
-          "cost bases disagree. Gross matters more than net &mdash; offsetting "
-          "legs can hide a large disagreement inside a small net.</div>")
-        p("<table><tr><th>account</th><th>instrument</th><th>status</th>"
-          "<th>px delta</th><th>P&amp;L divergence</th></tr>")
-        for r in div["worst"]:
-            p(f"<tr><td>{html.escape(str(r['account']))}</td>"
-              f"<td>{html.escape(str(r['label']))}</td>"
-              f"<td>{html.escape(str(r['status']))}</td>"
-              f"<td>{_m(r.get('px_delta'), '+.4f')}</td>"
-              f"<td><b>{_m(r.get('pnl_divergence'), '+,.0f')}</b></td></tr>")
-        p("</table>")
-        if div.get("by_ticker"):
-            rows = " &nbsp;·&nbsp; ".join(
-                f"{html.escape(str(k))} {v:+,.0f}"
-                for k, v in sorted(div["by_ticker"].items(), key=lambda x: -abs(x[1])))
-            p(f"<div class='muted' style='margin-top:6px'>by ticker: {rows}</div>")
+    exp = radar.get("expiring") or []
+    n_div = sum(1 for r in div.get("worst") or []
+                if r.get("status") in ("COST_BASIS_DRIFT", "PRICE_DRIFT"))
+
+    # ---- tabs
+    p("<div data-tabgroup='risk'><div class='tabnav'>")
+    for key, label in (("overview", "Overview"),
+                       ("greeks", f"Greeks by ticker ({len(tick)})"),
+                       ("expiry", f"Expiry ladder ({len(expiries)})"),
+                       ("margin", f"Margin &amp; accounts ({len(accounts)})"),
+                       ("basis", f"Cost basis{f' ({n_div})' if n_div else ''}")):
+        p(f"<a href='#' class='tabbtn' data-tab='risk-{key}'>{label}</a>")
+    p("</div>")
+
+    # ================= OVERVIEW =================
+    p("<div class='tabpanel' data-tab='risk-overview'>")
+    p("<div class='chartgrid'>")
+
+    p("<div class='card'><h3>Theta per day by ticker</h3>"
+      "<div class='muted' style='margin-bottom:4px'>What the book earns from a "
+      "day passing with nothing else changing. Short premium should sit on the "
+      "green side.</div>")
+    p(_diverging_bars(
+        [(t["underlying"], t.get("theta"),
+          f"{t['underlying']}: {(t.get('theta') or 0):+,.0f} per day",
+          None)
+         for t in sorted(tick, key=lambda t: -(t.get("theta") or 0))]))
+    p("</div>")
+
+    p("<div class='card'><h3>Delta exposure by ticker</h3>"
+      "<div class='muted' style='margin-bottom:4px'>Delta &times; underlying "
+      "price: the dollar notional the book is effectively long or short, so "
+      "tickers compare directly. A 1% move in the underlying moves P&amp;L by "
+      "1% of the bar. Near zero is the goal.</div>")
+    p(_diverging_bars(
+        [(t["underlying"], t.get("delta_dollars"),
+          f"{t['underlying']}: {(t.get('delta_dollars') or 0):+,.0f} notional, "
+          f"{(t.get('delta_dollars') or 0) / 100.0:+,.0f} per 1% move",
+          None)
+         for t in sorted(tick, key=lambda t: -(t.get("delta_dollars") or 0))]))
+    p("</div>")
+
+    p("<div class='card'><h3>Today's P&amp;L by ticker</h3>"
+      "<div class='muted' style='margin-bottom:4px'>Change in mark since "
+      "yesterday's close, from IBKR's own per-position daily P&amp;L.</div>")
+    p(_diverging_bars(
+        [(t["underlying"], t.get("daily_pnl"),
+          f"{t['underlying']}: {(t.get('daily_pnl') or 0):+,.0f} today",
+          None)
+         for t in sorted(tick, key=lambda t: -(t.get("daily_pnl") or 0))]))
+    p("</div>")
+
+    p("<div class='card'><h3>Vega by ticker</h3>"
+      "<div class='muted' style='margin-bottom:4px'>P&amp;L for a 1-point rise "
+      "in implied volatility. Negative is the normal state for a seller &mdash; "
+      "a volatility spike costs this much per point.</div>")
+    p(_diverging_bars(
+        [(t["underlying"], t.get("vega"),
+          f"{t['underlying']}: {(t.get('vega') or 0):+,.0f} per vol point",
+          None)
+         for t in sorted(tick, key=lambda t: -(t.get("vega") or 0))]))
+    p("</div>")
+    p("</div>")  # chartgrid
 
     # ---- equity curve
     try:
@@ -1698,79 +1890,107 @@ def render_risk_html() -> str:
             hist = json.load(fh)
     except (OSError, ValueError):
         hist = []
-    p("<h2>Equity curve</h2>")
+    p("<div class='card'><h3>Equity curve</h3>")
     if len(hist) < 2:
-        p(f"<div class='muted'>Logging NAV daily &mdash; {len(hist)} day(s) so far. "
-          "IBKR has no historical-NAV API, so this curve can only build forward "
-          "from today. For history before that, a Flex Web Service token and a "
-          "NAV query are needed.</div>")
+        p(f"<div class='muted'>Logging NAV daily &mdash; {len(hist)} day(s) so "
+          "far. IBKR has no historical-NAV API, so this curve can only build "
+          "forward from the day logging started. For history before that, a Flex "
+          "Web Service token and a NAV query are needed.</div>")
     else:
         first, last = hist[0], hist[-1]
-        chg = (last.get("nav_total") or 0) - (first.get("nav_total") or 0)
         base = first.get("nav_total") or 0
-        p("<table><tr><th>date</th><th>NAV</th><th>day P&amp;L</th></tr>")
-        for r in hist[-30:]:
-            p(f"<tr><td>{html.escape(str(r.get('date')))}</td>"
-              f"<td>{_m(r.get('nav_total'))}</td>"
-              f"<td>{_m(r.get('daily_pnl'), '+,.0f')}</td></tr>")
-        p("</table>")
+        chg = (last.get("nav_total") or 0) - base
+        p(_line_chart([(r.get("date"), r.get("nav_total")) for r in hist[-120:]]))
         p(f"<div class='muted'>{len(hist)} days logged &mdash; "
           f"{html.escape(str(first.get('date')))} to "
-          f"{html.escape(str(last.get('date')))}: {_m(chg, '+,.0f')}"
-          f" ({_m(chg / base * 100 if base else None, '+.2f', suffix='%')})</div>")
+          f"{html.escape(str(last.get('date')))}: {_m(chg, '+,.0f')} "
+          f"({_m(chg / base * 100 if base else None, '+.2f', suffix='%')}). "
+          "Hover a point for its date and NAV.</div>")
+    p("</div>")
+    p("</div>")  # overview panel
 
-    # ---- per ticker
-    tick = m.get("by_ticker") or []
-    book_theta = sum(t.get("theta") or 0 for t in tick)
-    book_vega = sum(t.get("vega") or 0 for t in tick)
-    book_daily = sum(t.get("daily_pnl") or 0 for t in tick)
-    nav = m.get("nav_total") or 0
-    p("<h2>Per ticker</h2>")
-    p("<table><tr><th>ticker</th><th>delta $</th><th>theta / day</th>"
-      "<th>vega</th><th>gamma</th><th>daily P&amp;L</th><th>daily %</th>"
-      "<th>% NAV</th><th>unrealised</th><th>IV</th><th>IVR</th><th>IVP</th>"
-      "<th>IV 1d</th><th>legs</th></tr>")
+    # ================= GREEKS BY TICKER =================
+    p("<div class='tabpanel' data-tab='risk-greeks'>")
+    p("<div class='card'><h3>Per ticker</h3>"
+      "<div class='muted' style='margin-bottom:6px'>Click any column heading to "
+      "sort. Delta $ is delta &times; underlying price &mdash; the notional the "
+      "book is effectively long or short; divide by 100 for the P&amp;L of a 1% "
+      "move. Daily % is measured against gross prior value (a spread's net value "
+      "nets toward zero and would give nonsense); % NAV is the contribution to "
+      "account equity.</div>")
+    p("<div class='table-wrap'><table class='sortable'><thead><tr>"
+      "<th class='l sortable'>ticker</th><th class='sortable'>delta $</th>"
+      "<th class='sortable'>theta / day</th><th class='sortable'>vega</th>"
+      "<th class='sortable'>gamma</th><th class='sortable'>daily P&amp;L</th>"
+      "<th class='sortable'>daily %</th><th class='sortable'>% NAV</th>"
+      "<th class='sortable'>unrealised</th><th class='sortable'>IV</th>"
+      "<th class='sortable'>IVR</th><th class='l'>&nbsp;</th>"
+      "<th class='sortable'>IVP</th><th class='sortable'>IV 1d</th>"
+      "<th class='sortable'>legs</th></tr></thead><tbody>")
     for t in tick:
         iv = t.get("iv")
-        p(f"<tr><td><b>{html.escape(str(t['underlying']))}</b></td>"
-          f"<td>{_m(t.get('delta_dollars'))}</td><td>{_m(t.get('theta'))}</td>"
-          f"<td>{_m(t.get('vega'))}</td><td>{_m(t.get('gamma'), ',.1f')}</td>"
-          f"<td>{_m(t.get('daily_pnl'))}</td>"
-          f"<td>{_m(t.get('daily_pnl_pct'), '.2f', suffix='%')}</td>"
-          f"<td>{_m(t.get('daily_pnl_pct_nav'), '.2f', suffix='%')}</td>"
-          f"<td>{_m(t.get('unrealized_pnl'))}</td>"
-          f"<td>{_m(iv * 100 if iv else None, '.1f', suffix='%')}</td>"
-          f"<td>{_iv_cell(t.get('iv_rank'))}</td>"
-          f"<td>{_m(t.get('iv_percentile'), '.0f')}</td>"
-          f"<td>{_m(t.get('chg_pct'), '+.1f', suffix='%')}</td>"
-          f"<td>{t.get('positions')}</td></tr>")
-    p(f"<tr><td><b>BOOK</b></td><td></td><td><b>{_m(book_theta)}</b></td>"
-      f"<td><b>{_m(book_vega)}</b></td><td></td>"
-      f"<td><b>{_m(book_daily)}</b></td><td></td>"
-      f"<td><b>{_m(book_daily / nav * 100 if nav else None, '.2f', suffix='%')}</b></td>"
-      f"<td colspan='5'></td><td></td></tr>")
-    p("</table>")
-    p("<div class='muted'>Delta $ is delta &times; underlying price, so tickers "
-      "compare directly. Daily % is measured against gross prior value (a "
-      "spread's net value nets toward zero and would give nonsense); % NAV is "
-      "the contribution to account equity. IV rank is red below 20 &mdash; "
-      "poor conditions to be selling premium.</div>")
+        rank = t.get("iv_rank")
+        meter_col = ("#ff7b72" if (rank or 0) < 20
+                     else "#f2cc60" if (rank or 0) < 40 else "#3fb950")
+        lo, hi = t.get("low_1y"), t.get("high_1y")
+        note = (f"IV {iv * 100:.1f}% within 1y range "
+                f"{lo * 100:.1f}%-{hi * 100:.1f}%") if iv and lo and hi else ""
+        p(f"<tr><td class='l'><b>{html.escape(str(t['underlying']))}</b></td>"
+          f"<td class='mono'{_sv(t.get('delta_dollars'))}>{_m(t.get('delta_dollars'))}</td>"
+          f"<td class='mono'{_sv(t.get('theta'))}>{_m(t.get('theta'))}</td>"
+          f"<td class='mono'{_sv(t.get('vega'))}>{_m(t.get('vega'))}</td>"
+          f"<td class='mono'{_sv(t.get('gamma'))}>{_m(t.get('gamma'), ',.1f')}</td>"
+          f"<td class='mono'{_sv(t.get('daily_pnl'))}>{_m(t.get('daily_pnl'))}</td>"
+          f"<td class='mono'{_sv(t.get('daily_pnl_pct'))}>"
+          f"{_m(t.get('daily_pnl_pct'), '.2f', suffix='%')}</td>"
+          f"<td class='mono'{_sv(t.get('daily_pnl_pct_nav'))}>"
+          f"{_m(t.get('daily_pnl_pct_nav'), '.2f', suffix='%')}</td>"
+          f"<td class='mono'{_sv(t.get('unrealized_pnl'))}>{_m(t.get('unrealized_pnl'))}</td>"
+          f"<td class='mono'{_sv(iv)}>{_m(iv * 100 if iv else None, '.1f', suffix='%')}</td>"
+          f"<td class='mono'{_sv(rank)}>{_iv_cell(rank)}</td>"
+          f"<td class='l'>{_meter(rank, colour=meter_col, label=note)}</td>"
+          f"<td class='mono'{_sv(t.get('iv_percentile'))}>"
+          f"{_m(t.get('iv_percentile'), '.0f')}</td>"
+          f"<td class='mono'{_sv(t.get('chg_pct'))}>"
+          f"{_m(t.get('chg_pct'), '+.1f', suffix='%')}</td>"
+          f"<td class='mono'{_sv(t.get('positions'))}>{t.get('positions')}</td></tr>")
+    p("</tbody><tfoot>")
+    p(f"<tr><td class='l'><b>BOOK</b></td><td class='mono'><b>{_m(book_delta)}</b></td>"
+      f"<td class='mono'><b>{_m(book_theta)}</b></td>"
+      f"<td class='mono'><b>{_m(book_vega)}</b></td><td></td>"
+      f"<td class='mono'><b>{_m(book_daily)}</b></td><td></td>"
+      f"<td class='mono'><b>"
+      f"{_m(book_daily / nav * 100 if nav else None, '.2f', suffix='%')}</b></td>"
+      f"<td class='mono'><b>{_m(book_unreal)}</b></td>"
+      f"<td colspan='6'></td></tr>")
+    p("</tfoot></table></div></div>")
 
-    # ---- per expiry
-    p("<h2>Per expiry</h2>")
-    p("<table><tr><th>ticker</th><th>expiry</th><th>delta $</th>"
-      "<th>theta / day</th><th>vega</th><th>gamma</th><th>daily P&amp;L</th>"
-      "<th>daily %</th><th>unrealised</th><th>legs</th></tr>")
-    for e in m.get("by_expiry") or []:
-        p(f"<tr><td>{html.escape(str(e['underlying']))}</td>"
-          f"<td>{html.escape(str(e.get('expiry_label')))}</td>"
-          f"<td>{_m(e.get('delta_dollars'))}</td><td>{_m(e.get('theta'))}</td>"
-          f"<td>{_m(e.get('vega'))}</td><td>{_m(e.get('gamma'), ',.1f')}</td>"
-          f"<td>{_m(e.get('daily_pnl'))}</td>"
-          f"<td>{_m(e.get('daily_pnl_pct'), '.2f', suffix='%')}</td>"
-          f"<td>{_m(e.get('unrealized_pnl'))}</td>"
-          f"<td>{e.get('positions')}</td></tr>")
-    p("</table>")
+    p("<div class='card'><h3>Implied volatility &mdash; where each ticker sits "
+      "in its own 1-year range</h3>"
+      "<div class='muted' style='margin-bottom:4px'>IV rank is the position of "
+      "today's implied volatility between its 1-year low and high. Below 20 is "
+      "red: options are cheap, which is poor conditions to be selling them.</div>")
+    p("<div class='table-wrap'><table><tr><th class='l'>ticker</th>"
+      "<th>1y low</th><th class='l'>rank</th><th>1y high</th><th>IV now</th>"
+      "<th>IVR</th><th>IVP</th><th>1d change</th><th>samples</th></tr>")
+    for t in sorted(tick, key=lambda t: -(t.get("iv_rank") or 0)):
+        rank, iv = t.get("iv_rank"), t.get("iv")
+        if iv is None:
+            continue
+        meter_col = ("#ff7b72" if (rank or 0) < 20
+                     else "#f2cc60" if (rank or 0) < 40 else "#3fb950")
+        lo, hi = t.get("low_1y"), t.get("high_1y")
+        p(f"<tr><td class='l'><b>{html.escape(str(t['underlying']))}</b></td>"
+          f"<td class='mono'>{_m(lo * 100 if lo else None, '.1f', suffix='%')}</td>"
+          f"<td class='l' style='width:200px'>"
+          f"{_meter(rank, colour=meter_col, label=f'IV rank {rank:.0f}' if rank is not None else '')}</td>"
+          f"<td class='mono'>{_m(hi * 100 if hi else None, '.1f', suffix='%')}</td>"
+          f"<td class='mono'><b>{_m(iv * 100, '.1f', suffix='%')}</b></td>"
+          f"<td class='mono'>{_iv_cell(rank)}</td>"
+          f"<td class='mono'>{_m(t.get('iv_percentile'), '.0f')}</td>"
+          f"<td class='mono'>{_m(t.get('chg_pct'), '+.1f', suffix='%')}</td>"
+          f"<td class='mono muted'>{t.get('samples') or ''}</td></tr>")
+    p("</table></div></div>")
 
     missing = sum(t.get("greeks_missing") or 0 for t in tick)
     if missing:
@@ -1778,7 +1998,190 @@ def render_risk_html() -> str:
           "are excluded from the delta/theta/vega totals, so those totals "
           "understate the book. Usually a missing market-data permission or a "
           "contract that was not quoting when the snapshot was taken.</div>")
-    return "".join(out) + "</body></html>"
+    p("</div>")  # greeks panel
+
+    # ================= EXPIRY LADDER =================
+    p("<div class='tabpanel' data-tab='risk-expiry'>")
+    if exp:
+        itm = [r for r in exp if r["itm"]]
+        p("<div class='card'><h3>Expiring within "
+          f"{radar.get('within_days', 7)} days</h3>"
+          f"<div class='muted' style='margin-bottom:6px'>{len(exp)} leg(s), "
+          f"{len(itm)} in the money. In-the-money legs settle for cash or become "
+          "stock; either way ONE will not book it for you.</div>")
+        p("<div class='table-wrap'><table class='sortable'><thead><tr>"
+          "<th class='l sortable'>account</th><th class='l sortable'>contract</th>"
+          "<th class='sortable'>qty</th><th class='sortable'>DTE</th>"
+          "<th class='sortable'>spot</th><th class='l sortable'>moneyness</th>"
+          "<th class='sortable'>delta</th><th class='l sortable'>settles</th>"
+          "</tr></thead><tbody>")
+        for r in exp:
+            tag = ("<b style='color:#f2cc60'>ITM</b>" if r["itm"]
+                   else "<span class='muted'>OTM</span>")
+            p(f"<tr><td class='l'>{html.escape(str(r['account']))}</td>"
+              f"<td class='l mono'>{html.escape(str(r['underlying']))} "
+              f"{html.escape(str(r['expiry_label']))} "
+              f"{r['strike']:g}{r['right']}</td>"
+              f"<td class='mono'{_sv(r['qty'])}>{r['qty']:+.0f}</td>"
+              f"<td class='mono'{_sv(r['dte'])}>{r['dte']}</td>"
+              f"<td class='mono'{_sv(r.get('spot'))}>{_m(r.get('spot'), ',.2f')}</td>"
+              f"<td class='l'{_sv(1 if r['itm'] else 0)}>{tag}</td>"
+              f"<td class='mono'{_sv(r.get('delta'))}>{_m(r.get('delta'), '.3f')}</td>"
+              f"<td class='l muted'>{'cash' if r['cash_settled'] else 'shares'}</td>"
+              f"</tr>")
+        p("</tbody></table></div></div>")
+
+    p("<div class='chartgrid'>")
+    p("<div class='card'><h3>Theta by expiry</h3>"
+      "<div class='muted' style='margin-bottom:4px'>Where the decay is actually "
+      "earned. Colour is the ticker; expiries run nearest first.</div>")
+    p(_diverging_bars(
+        [(f"{e['underlying']} {str(e.get('expiry_label'))[5:]}", e.get("theta"),
+          f"{e['underlying']} {e.get('expiry_label')}: "
+          f"{(e.get('theta') or 0):+,.0f}/day, {e.get('positions')} legs",
+          _colour_for(e["underlying"], order))
+         for e in expiries], row_h=20))
+    p("</div>")
+    p("<div class='card'><h3>Vega by expiry</h3>"
+      "<div class='muted' style='margin-bottom:4px'>Volatility exposure "
+      "concentrates in the far months, where a vol move is worth most.</div>")
+    p(_diverging_bars(
+        [(f"{e['underlying']} {str(e.get('expiry_label'))[5:]}", e.get("vega"),
+          f"{e['underlying']} {e.get('expiry_label')}: "
+          f"{(e.get('vega') or 0):+,.0f} per vol point",
+          _colour_for(e["underlying"], order))
+         for e in expiries], row_h=20))
+    p("</div>")
+    p("</div>")
+
+    p("<div class='card'><h3>Per expiry</h3>"
+      "<div class='muted' style='margin-bottom:6px'>Click any column heading to "
+      "sort &mdash; sorting by theta or unrealised finds the expiry carrying the "
+      "book.</div>")
+    p("<div class='table-wrap'><table class='sortable'><thead><tr>"
+      "<th class='l sortable'>ticker</th><th class='l sortable'>expiry</th>"
+      "<th class='sortable'>delta $</th><th class='sortable'>theta / day</th>"
+      "<th class='sortable'>vega</th><th class='sortable'>gamma</th>"
+      "<th class='sortable'>daily P&amp;L</th><th class='sortable'>daily %</th>"
+      "<th class='sortable'>unrealised</th><th class='sortable'>legs</th>"
+      "</tr></thead><tbody>")
+    for e in expiries:
+        col = _colour_for(e["underlying"], order)
+        p(f"<tr><td class='l'><span class='dot' style='background:{col}'></span>"
+          f"{html.escape(str(e['underlying']))}</td>"
+          f"<td class='l mono'>{html.escape(str(e.get('expiry_label')))}</td>"
+          f"<td class='mono'{_sv(e.get('delta_dollars'))}>{_m(e.get('delta_dollars'))}</td>"
+          f"<td class='mono'{_sv(e.get('theta'))}>{_m(e.get('theta'))}</td>"
+          f"<td class='mono'{_sv(e.get('vega'))}>{_m(e.get('vega'))}</td>"
+          f"<td class='mono'{_sv(e.get('gamma'))}>{_m(e.get('gamma'), ',.1f')}</td>"
+          f"<td class='mono'{_sv(e.get('daily_pnl'))}>{_m(e.get('daily_pnl'))}</td>"
+          f"<td class='mono'{_sv(e.get('daily_pnl_pct'))}>"
+          f"{_m(e.get('daily_pnl_pct'), '.2f', suffix='%')}</td>"
+          f"<td class='mono'{_sv(e.get('unrealized_pnl'))}>{_m(e.get('unrealized_pnl'))}</td>"
+          f"<td class='mono'{_sv(e.get('positions'))}>{e.get('positions')}</td></tr>")
+    p("</tbody></table></div></div>")
+    p("</div>")  # expiry panel
+
+    # ================= MARGIN =================
+    p("<div class='tabpanel' data-tab='risk-margin'>")
+    p("<div class='card'><h3>Accounts &amp; margin</h3>"
+      "<div class='muted' style='margin-bottom:6px'>Headroom is excess liquidity "
+      "over net liquidation: how far the account can fall before a margin call. "
+      "Amber under 40%, red under 20%.</div>")
+    p("<div class='table-wrap'><table class='sortable'><thead><tr>"
+      "<th class='l sortable'>account</th><th class='sortable'>NAV</th>"
+      "<th class='sortable'>cash</th><th class='sortable'>gross position</th>"
+      "<th class='sortable'>init margin</th><th class='sortable'>maint margin</th>"
+      "<th class='sortable'>excess liquidity</th><th class='sortable'>headroom</th>"
+      "<th class='l'>&nbsp;</th><th class='sortable'>init util</th>"
+      "</tr></thead><tbody>")
+    for acct, d in sorted(accounts.items()):
+        cur = d.get("currency") or ""
+        hp = d.get("headroom_pct")
+        col = ("#3fb950" if (hp or 0) >= 40 else
+               "#f2cc60" if (hp or 0) >= 20 else "#ff7b72")
+        p(f"<tr><td class='l'><b>{html.escape(acct)}</b></td>"
+          f"<td class='mono'{_sv(d.get('NetLiquidation'))}>"
+          f"{_m(d.get('NetLiquidation'))} <span class='muted'>{cur}</span></td>"
+          f"<td class='mono'{_sv(d.get('TotalCashValue'))}>{_m(d.get('TotalCashValue'))}</td>"
+          f"<td class='mono'{_sv(d.get('GrossPositionValue'))}>"
+          f"{_m(d.get('GrossPositionValue'))}</td>"
+          f"<td class='mono'{_sv(d.get('FullInitMarginReq'))}>"
+          f"{_m(d.get('FullInitMarginReq'))}</td>"
+          f"<td class='mono'{_sv(d.get('FullMaintMarginReq'))}>"
+          f"{_m(d.get('FullMaintMarginReq'))}</td>"
+          f"<td class='mono'{_sv(d.get('ExcessLiquidity'))}>"
+          f"{_m(d.get('ExcessLiquidity'))}</td>"
+          f"<td class='mono'{_sv(hp)}>{_headroom_cell(hp)}</td>"
+          f"<td class='l' style='width:120px'>"
+          f"{_meter(hp, hi=60, colour=col, label='headroom')}</td>"
+          f"<td class='mono'{_sv(d.get('init_margin_util_pct'))}>"
+          f"{_m(d.get('init_margin_util_pct'), '.0f', suffix='%')}</td></tr>")
+    p("</tbody></table></div></div>")
+
+    p("<div class='chartgrid'>")
+    p("<div class='card'><h3>Headroom by account</h3>"
+      "<div class='muted' style='margin-bottom:4px'>Excess liquidity as a "
+      "percentage of net liquidation.</div>")
+    p(_diverging_bars(
+        [(a, d.get("headroom_pct"),
+          f"{a}: {(d.get('headroom_pct') or 0):.1f}% headroom",
+          ("#3fb950" if (d.get("headroom_pct") or 0) >= 40 else
+           "#f2cc60" if (d.get("headroom_pct") or 0) >= 20 else "#ff7b72"))
+         for a, d in sorted(accounts.items())], fmt="{:.1f}%"))
+    p("</div>")
+    p("<div class='card'><h3>Net liquidation by account</h3>"
+      "<div class='muted' style='margin-bottom:4px'>Equity per account.</div>")
+    p(_diverging_bars(
+        [(a, d.get("NetLiquidation"), f"{a}: {_m(d.get('NetLiquidation'))}", "#58a6ff")
+         for a, d in sorted(accounts.items())], fmt="{:,.0f}"))
+    p("</div>")
+    p("</div>")
+    p("</div>")  # margin panel
+
+    # ================= COST BASIS =================
+    p("<div class='tabpanel' data-tab='risk-basis'>")
+    if div.get("worst"):
+        p("<div class='card'><h3>Cost-basis P&amp;L divergence &mdash; ONE vs "
+          "IBKR</h3>")
+        p(f"<div class='sub'>Net <b>{_m(div.get('net'), '+,.0f')}</b> "
+          f"&nbsp;|&nbsp; gross <b>{_m(div.get('gross'))}</b></div>")
+        p("<div class='muted' style='margin-bottom:6px'>ONE reports no P&amp;L "
+          "for an open leg, so this prices the consequence instead: when these "
+          "positions close, ONE will report this many dollars more profit than "
+          "IBKR purely because the two cost bases disagree. Gross matters more "
+          "than net &mdash; offsetting legs can hide a large disagreement inside "
+          "a small net.</div>")
+        p("<div class='table-wrap'><table class='sortable'><thead><tr>"
+          "<th class='l sortable'>account</th><th class='l sortable'>instrument</th>"
+          "<th class='l sortable'>status</th><th class='sortable'>px delta</th>"
+          "<th class='sortable'>P&amp;L divergence</th></tr></thead><tbody>")
+        for r in div["worst"]:
+            colour = STATUS_COLORS.get(r.get("status"), "#8b949e")
+            p(f"<tr><td class='l'>{html.escape(str(r['account']))}</td>"
+              f"<td class='l mono'>{html.escape(str(r['label']))}</td>"
+              f"<td class='l'><span class='tag' style='background:{colour}'>"
+              f"{html.escape(str(r['status']))}</span></td>"
+              f"<td class='mono'{_sv(r.get('px_delta'))}>"
+              f"{_m(r.get('px_delta'), '+.4f')}</td>"
+              f"<td class='mono'{_sv(r.get('pnl_divergence'))}>"
+              f"<b>{_m(r.get('pnl_divergence'), '+,.0f')}</b></td></tr>")
+        p("</tbody></table></div>")
+        if div.get("by_ticker"):
+            p("</div><div class='card'><h3>Divergence by ticker</h3>")
+            p(_diverging_bars(
+                [(k, v, f"{k}: {v:+,.0f}", None)
+                 for k, v in sorted(div["by_ticker"].items(),
+                                    key=lambda x: -abs(x[1]))]))
+        p("</div>")
+    else:
+        p("<div class='card'><div class='muted'>No cost-basis divergence "
+          "recorded yet &mdash; run a reconciliation first.</div></div>")
+    p("</div>")  # basis panel
+
+    p("</div>")  # tabgroup
+    p(TAB_JS)
+    return "".join(out) + "</div></body></html>"
 
 
 def render_oneos_html() -> str:

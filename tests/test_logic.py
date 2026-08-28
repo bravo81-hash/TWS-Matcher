@@ -639,6 +639,37 @@ class DashboardAdjustmentTests(unittest.TestCase):
         self.assertNotIn("background:#3a2d0a", page)
 
 
+    def test_cost_basis_drift_row_carries_the_price_and_the_dollars(self):
+        """A price flag the user cannot price is a flag they cannot act on."""
+        finding = {
+            "status": "COST_BASIS_DRIFT", "label": "RUT 2026-09-17 2950P",
+            "ibkr_qty": 4.0, "ibkr_px": 26.3958, "one_qty": 4.0,
+            "one_px": 46.0467, "px_delta": -19.6509,
+            "pnl_divergence": -7860.36, "underlying": "RUT",
+        }
+        with dashboard._lock:
+            original = dict(dashboard._state)
+            dashboard._state.update({
+                "status": "ok",
+                "result": {"accounts": {"U4557912": [finding]},
+                           "ignore_one_accounts": [], "unmapped_one_groups": {},
+                           "fills_today": []},
+                "error": None, "last_cycle": "2026-08-29T06:35:00+00:00",
+                "ibkr_connected": True, "one_file": "report.csv",
+                "one_mtime": time.time(), "activity": {},
+                "account_codes": {}, "os_strategies": [], "flex": {}, "naming": [],
+            })
+        try:
+            page = dashboard.render_html()
+        finally:
+            with dashboard._lock:
+                dashboard._state.clear()
+                dashboard._state.update(original)
+        self.assertIn("46.05", page)      # ONE's price, so the user knows what to change
+        self.assertIn("-19.65", page)     # how far apart they are
+        self.assertIn("-7,860", page)     # what it is worth
+        self.assertIn("Set ONE&#x27;s", page.replace("'", "&#x27;"))
+
 class FlexImportCompletenessTests(unittest.TestCase):
     @staticmethod
     def fill(*, exec_id="E1", qty=1.0):
@@ -721,6 +752,116 @@ class FlexImportCompletenessTests(unittest.TestCase):
             rows, skipped = flex_export.generate(merged)
             self.assertEqual(dict(rows), {})
             self.assertEqual(skipped, 1)
+
+
+
+class RiskChartTests(unittest.TestCase):
+    """The Risk page draws its own SVG, so a malformed string is a blank chart
+    rather than an exception.  Parse every chart as XML to catch that."""
+
+    def assert_svg(self, markup):
+        import xml.etree.ElementTree as ET
+        self.assertIn("<svg", markup)
+        ET.fromstring(markup)          # raises ParseError if the browser would choke
+        return markup
+
+    def test_diverging_bars_renders_both_signs_around_a_zero_line(self):
+        svg = self.assert_svg(dashboard._diverging_bars([
+            ("RUT", 999.0, "RUT theta", None),
+            ("NFLX", -2.0, "NFLX theta", None),
+        ]))
+        self.assertIn("RUT", svg)
+        self.assertIn("#3fb950", svg)   # positive bar
+        self.assertIn("#ff7b72", svg)   # negative bar
+
+    def test_diverging_bars_skips_missing_values_and_survives_all_zero(self):
+        svg = self.assert_svg(dashboard._diverging_bars([
+            ("A", 0.0, "a", None), ("B", None, "b", None),
+        ]))
+        self.assertIn("A", svg)
+        self.assertNotIn(">B<", svg)
+
+    def test_diverging_bars_with_nothing_to_draw_says_so(self):
+        out = dashboard._diverging_bars([("A", None, "a", None)])
+        self.assertNotIn("<svg", out)
+        self.assertIn("no data", out)
+
+    def test_diverging_bars_escapes_a_hostile_label(self):
+        svg = self.assert_svg(dashboard._diverging_bars(
+            [("<script>x</script>", 1.0, "t & t", None)]))
+        self.assertNotIn("<script>", svg)
+
+    def test_line_chart_needs_two_points(self):
+        self.assertNotIn("<svg", dashboard._line_chart([("2026-08-27", 1.0)]))
+        self.assert_svg(dashboard._line_chart(
+            [("2026-08-27", 447152.88), ("2026-08-28", 450910.5)]))
+
+    def test_line_chart_survives_a_flat_series(self):
+        # hi == lo would be a divide-by-zero when scaling to the plot height
+        self.assert_svg(dashboard._line_chart(
+            [("d1", 100.0), ("d2", 100.0), ("d3", 100.0)]))
+
+    def test_line_chart_ignores_days_that_failed_to_log(self):
+        self.assert_svg(dashboard._line_chart(
+            [("d1", 100.0), ("d2", None), ("d3", 120.0)]))
+
+    def test_meter_clamps_out_of_range_values(self):
+        self.assertIn("width:100%", dashboard._meter(180, hi=60))
+        self.assertIn("width:0%", dashboard._meter(-5))
+        self.assertIn("&mdash;", dashboard._meter(None))
+
+    def test_risk_page_renders_every_tab_from_a_real_snapshot(self):
+        metrics = {
+            "captured_at": "2026-08-29T06:35:00",
+            "nav_total": 447559.72,
+            "accounts": {"U23260336": {
+                "NetLiquidation": 199833.82, "TotalCashValue": 133746.5,
+                "GrossPositionValue": 2421248.97, "FullInitMarginReq": 183065.74,
+                "FullMaintMarginReq": 166185.42, "ExcessLiquidity": 33648.4,
+                "currency": "AUD", "headroom_pct": 16.83, "init_margin_util_pct": 91.6}},
+            "iv": {}, "by_expiry": [{
+                "underlying": "RUT", "expiry": "20260904", "expiry_label": "2026-09-04",
+                "delta_dollars": 1000.0, "theta": 727.0, "vega": -752.0, "gamma": -1.0,
+                "daily_pnl": 10.0, "daily_pnl_pct": 0.5, "unrealized_pnl": 5.0,
+                "positions": 12}],
+            "by_ticker": [{
+                "underlying": "RUT", "delta": 7.41, "gamma": -3.42, "vega": -761.1,
+                "theta": 998.8, "delta_dollars": 22311.2, "daily_pnl": 10126.6,
+                "unrealized_pnl": 40009.4, "positions": 59, "greeks_missing": 0,
+                "daily_pnl_pct": 0.92, "daily_pnl_pct_nav": 2.26, "iv": 0.1603,
+                "iv_rank": 1.8, "iv_percentile": 0.8, "chg_pct": -3.8,
+                "low_1y": 0.157, "high_1y": 0.331, "samples": 251}],
+            "radar": {"within_days": 7, "assignment_risk": [], "expiring": []},
+        }
+        with dashboard._lock:
+            dashboard._state["metrics"] = metrics
+            dashboard._state["metrics_at"] = "2026-08-29 06:35:00"
+            dashboard._state["result"] = {"pnl_divergence": {
+                "net": -7397.25, "gross": 11350.59, "by_ticker": {"RUT": -6543.88},
+                "worst": [{"account": "U4557912", "label": "RUT 2026-09-17 2950P",
+                           "status": "COST_BASIS_DRIFT", "px_delta": -19.6509,
+                           "pnl_divergence": -7860.36}]}}
+        try:
+            page = dashboard.render_risk_html()
+        finally:
+            with dashboard._lock:
+                for k in ("metrics", "metrics_at", "result"):
+                    dashboard._state.pop(k, None)
+
+        for panel in ("risk-overview", "risk-greeks", "risk-expiry",
+                      "risk-margin", "risk-basis"):
+            self.assertIn(f"data-tab='{panel}'", page)
+        self.assertEqual(page.count("<div"), page.count("</div>"))
+        self.assertIn("Theta / day", page)            # KPI strip
+        self.assertIn("RUT 2026-09-17 2950P", page)   # divergence carried through
+        self.assertIn("<svg", page)
+
+    def test_risk_page_before_the_first_collection_is_not_broken_html(self):
+        with dashboard._lock:
+            dashboard._state.pop("metrics", None)
+        page = dashboard.render_risk_html()
+        self.assertIn("Waiting for the first Greeks collection", page)
+        self.assertEqual(page.count("<div"), page.count("</div>"))
 
 
 class PortableEmailTests(unittest.TestCase):
